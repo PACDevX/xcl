@@ -15,7 +15,8 @@
 //! one recording, so no more allocators are put aside than there are lists.
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
-use std::sync::Mutex;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -51,19 +52,45 @@ struct State {
     of_list: HashMap<usize, usize>,
     /// title allocator → the type of the lists on it
     types: HashMap<usize, i32>,
-    fences: HashMap<usize, (ID3D12Fence, u64)>,
+    fences: HashMap<usize, Arc<Mutex<Option<QueueFence>>>>,
     made: u64,
     swaps: u64,
+    /// PC list → its last submit (queue, fence, value after it, recording number then)
+    last_submit: HashMap<usize, LastSubmit>,
+    /// PC list → recordings so far (a Reset or creation starts the next one)
+    recordings: HashMap<usize, u64>,
+    resubmits: u64,
+    reserved_submits: HashSet<usize>,
+    unmarked_submits: HashSet<usize>,
+}
+
+struct QueueFence {
+    fence: ID3D12Fence,
+    value: u64,
+}
+
+#[derive(Clone)]
+struct LastSubmit {
+    queue: usize,
+    fence: ID3D12Fence,
+    value: u64,
+    recording: u64,
 }
 
 unsafe impl Send for State {}
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
+static SUBMIT_AVAILABLE: Condvar = Condvar::new();
 
 /// `XCL_ALLOC_SWAP=0` turns it off.
 pub fn enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| !std::env::var("XCL_ALLOC_SWAP").is_ok_and(|v| v.trim() == "0"))
+}
+
+pub(super) fn serialize_resubmits() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_SERIALIZE_RESUBMITS").is_ok_and(|v| v.trim() == "1"))
 }
 
 fn move_list(s: &mut State, list: usize, backing: usize) {
@@ -82,6 +109,9 @@ fn move_list(s: &mut State, list: usize, backing: usize) {
 pub(super) fn forget_list(list: usize) {
     let mut g = STATE.lock().unwrap();
     let Some(s) = g.as_mut() else { return };
+    s.last_submit.remove(&list);
+    s.unmarked_submits.remove(&list);
+    s.recordings.remove(&list);
     if let Some(backing) = s.of_list.remove(&list) {
         if let Some(b) = s.backings.get_mut(&backing) {
             b.users.remove(&list);
@@ -103,6 +133,7 @@ pub fn reset_list(list: usize, alloc: usize, ty: i32, reset: impl FnOnce(usize) 
         s.types.insert(alloc, ty);
     }
     move_list(s, list, backing);
+    *s.recordings.entry(list).or_default() += 1;
     hr
 }
 
@@ -136,38 +167,209 @@ pub fn created_on(list: usize, raw: usize, ty: i32) {
     let s = g.get_or_insert_with(State::default);
     s.types.entry(raw).or_insert(ty);
     move_list(s, list, raw);
+    *s.recordings.entry(list).or_default() += 1;
 }
 
-/// `lists` were just submitted to `queue`.
-pub unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void]) {
-    if !enabled() || queue.is_null() {
-        return;
+/// Diagnostic (#1452): `lists` are about to be submitted to `queue`. A PC list whose previous
+/// submit the GPU has not finished must not be submitted again on the PC (debug layer id 553,
+/// "the command queue fence has not advanced past previous executions of the command list");
+/// a console lets a title do it. Logged (the first 8, then at powers of two) with whether it is
+/// the same recording and the same queue. Every submitted PC list is seen (`executed` marks them all).
+pub unsafe fn note_resubmits(queue: *mut c_void, lists: &[*mut c_void]) -> usize {
+    if !enabled() {
+        return 0;
     }
     let mut g = STATE.lock().unwrap();
-    let Some(s) = g.as_mut() else { return };
-    if !lists.iter().any(|l| s.of_list.contains_key(&(*l as usize))) {
-        return;
-    }
-    let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return };
-    let key = queue as usize;
-    if !s.fences.contains_key(&key) {
-        let mut dev: Option<ID3D12Device> = None;
-        let Some(f) = q.GetDevice(&mut dev).ok().and(dev).and_then(|d| d.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok()) else { return };
-        s.fences.insert(key, (f, 0));
-    }
-    let (fence, value) = {
-        let (f, v) = s.fences.get_mut(&key).unwrap();
-        if q.Signal(&*f, *v + 1).is_err() {
-            return;
+    let Some(s) = g.as_mut() else { return 0 };
+    let mut found = 0;
+    for &l in lists {
+        let l = l as usize;
+        let Some(last) = s.last_submit.get(&l) else { continue };
+        if last.fence.GetCompletedValue() >= last.value {
+            continue;
         }
-        *v += 1;
-        (f.clone(), *v)
+        let same_recording = s.recordings.get(&l).copied().unwrap_or(0) == last.recording;
+        let same_queue = last.queue == queue as usize;
+        found += 1;
+        s.resubmits += 1;
+        let n = s.resubmits;
+        if n <= 8 || n.is_power_of_two() {
+            crate::xlog_warn!(
+                "D3D12.X: a command list is submitted while its previous submit is still on the GPU ({}, {}; #{n} so far) – the PC does not allow it (debug layer id 553)",
+                if same_recording { "the same recording" } else { "a new recording" },
+                if same_queue { "the same queue" } else { "another queue" },
+            );
+        }
+    }
+    found
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ResubmitError {
+    TimedOut,
+    DeviceRemoved,
+    TrackingFailed,
+}
+
+impl std::fmt::Display for ResubmitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::TimedOut => "previous command list submission did not complete in time",
+            Self::DeviceRemoved => "command list fence reports device removal",
+            Self::TrackingFailed => "command list submission has no completion mark",
+        })
+    }
+}
+
+struct SubmitReservation<'a> {
+    lists: &'a [*mut c_void],
+    mark_pending: bool,
+}
+
+impl Drop for SubmitReservation<'_> {
+    fn drop(&mut self) {
+        {
+            let mut g = STATE.lock().unwrap();
+            let s = g.as_mut().unwrap();
+            for &list in self.lists {
+                let key = list as usize;
+                if self.mark_pending {
+                    s.unmarked_submits.insert(key);
+                }
+                s.reserved_submits.remove(&key);
+            }
+        }
+        SUBMIT_AVAILABLE.notify_all();
+    }
+}
+
+fn reserve_submits(lists: &[*mut c_void], deadline: Instant) -> Result<(SubmitReservation<'_>, Vec<LastSubmit>), ResubmitError> {
+    let mut g = STATE.lock().unwrap();
+    loop {
+        let s = g.get_or_insert_with(State::default);
+        if lists.iter().any(|&l| s.unmarked_submits.contains(&(l as usize))) {
+            return Err(ResubmitError::TrackingFailed);
+        }
+        // Reserve all lists at once. Two submissions that share multiple lists cannot each
+        // reserve a subset and then wait for the other to release the rest.
+        if lists.iter().all(|&l| !s.reserved_submits.contains(&(l as usize))) {
+            let previous = lists.iter().filter_map(|&l| s.last_submit.get(&(l as usize)).cloned()).collect();
+            s.reserved_submits.extend(lists.iter().map(|&l| l as usize));
+            return Ok((SubmitReservation { lists, mark_pending: false }, previous));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(ResubmitError::TimedOut);
+        }
+        (g, _) = SUBMIT_AVAILABLE.wait_timeout(g, remaining).unwrap();
+    }
+}
+
+unsafe fn submit_unique(lists: &[*mut c_void], timeout: Duration, submit: &mut impl FnMut(&[*mut c_void]) -> bool) -> Result<(), ResubmitError> {
+    let deadline = Instant::now() + timeout;
+    let (mut reservation, previous) = reserve_submits(lists, deadline)?;
+    for last in previous {
+        loop {
+            let done = super::real::fence_completed(&last.fence);
+            if done == u64::MAX {
+                return Err(ResubmitError::DeviceRemoved);
+            }
+            if done >= last.value {
+                break;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(ResubmitError::TimedOut);
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(1)));
+        }
+    }
+    reservation.mark_pending = true;
+    if !submit(lists) {
+        return Err(ResubmitError::TrackingFailed);
+    }
+    reservation.mark_pending = false;
+    Ok(())
+}
+
+unsafe fn submit_serialized(lists: &[*mut c_void], timeout: Duration, submit: &mut impl FnMut(&[*mut c_void]) -> bool) -> Result<(), ResubmitError> {
+    let mut first = 0;
+    let mut seen = HashSet::with_capacity(lists.len());
+    for (i, &list) in lists.iter().enumerate() {
+        if !seen.insert(list as usize) {
+            submit_unique(&lists[first..i], timeout, submit)?;
+            first = i;
+            seen.clear();
+            seen.insert(list as usize);
+        }
+    }
+    submit_unique(&lists[first..], timeout, submit)
+}
+
+/// A repeated PC list must wait for the previous native submission to finish (#1452).
+/// Each callback must submit its chunk, publish its completion marks with `executed`, and
+/// finish any per-chunk bookkeeping before returning whether the marks were published.
+pub(super) unsafe fn submit_guarded(queue: *mut c_void, lists: &[*mut c_void], mut submit: impl FnMut(&[*mut c_void]) -> bool) -> Result<(), ResubmitError> {
+    if !serialize_resubmits() {
+        submit(lists);
+        return Ok(());
+    }
+    if !enabled() || queue.is_null() || lists.iter().any(|l| l.is_null()) {
+        return Err(ResubmitError::TrackingFailed);
+    }
+    submit_serialized(lists, Duration::from_secs(2), &mut submit)
+}
+
+/// Whether the GPU has not finished the last submit of the PC list `list` (#1452: it must not be
+/// submitted again before that; `title_list` records the title's next recording elsewhere).
+pub fn in_flight(list: usize) -> bool {
+    let previous = {
+        let g = STATE.lock().unwrap();
+        let Some(s) = g.as_ref() else { return false };
+        if s.reserved_submits.contains(&list) || s.unmarked_submits.contains(&list) {
+            return true;
+        }
+        s.last_submit.get(&list).cloned()
     };
+    previous.is_some_and(|l| unsafe { super::real::fence_completed(&l.fence) } < l.value)
+}
+
+/// `lists` were just submitted to `queue`. True if their completion marks were published.
+pub unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void]) -> bool {
+    if !enabled() || queue.is_null() {
+        return false;
+    }
+    // (every submit is marked, also of lists this module does not track – the PC lists behind
+    // console lists – so note_resubmits sees them all)
+    let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return false };
+    let key = queue as usize;
+    let queue_fence = {
+        let mut g = STATE.lock().unwrap();
+        g.get_or_insert_with(State::default).fences.entry(key).or_default().clone()
+    };
+    // Serialize mark publication for this queue while keeping the pool lock clear of D3D calls.
+    let mut mark = queue_fence.lock().unwrap();
+    if mark.is_none() {
+        let mut dev: Option<ID3D12Device> = None;
+        let Some(fence) = q.GetDevice(&mut dev).ok().and(dev).and_then(|d| d.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok()) else { return false };
+        *mark = Some(QueueFence { fence, value: 0 });
+    }
+    let mark = mark.as_mut().unwrap();
+    let Some(value) = mark.value.checked_add(1).filter(|&v| v != u64::MAX) else { return false };
+    if q.Signal(&mark.fence, value).is_err() {
+        return false;
+    }
+    mark.value = value;
+    let mut g = STATE.lock().unwrap();
+    let s = g.get_or_insert_with(State::default);
     for &l in lists {
         if let Some(&b) = s.of_list.get(&(l as usize)) {
-            s.backings.entry(b).or_default().marks.insert(key, (fence.clone(), value));
+            s.backings.entry(b).or_default().marks.insert(key, (mark.fence.clone(), value));
         }
+        let recording = s.recordings.get(&(l as usize)).copied().unwrap_or(0);
+        s.last_submit.insert(l as usize, LastSubmit { queue: key, fence: mark.fence.clone(), value, recording });
     }
+    true
 }
 
 /// The title's allocator `alloc` is gone (its last Release): nothing of it stays here – a later
@@ -607,6 +809,131 @@ mod tests {
             drop(alloc);
             assert_eq!(current(a as usize), a as usize, "a released allocator leaves nothing behind");
             assert!(!STATE.lock().unwrap().as_ref().unwrap().types.contains_key(&(a as usize)));
+        }
+    }
+
+    /// A list submitted again while its previous submit is still on the GPU is counted (and
+    /// logged); once that submit is done, or after the list is forgotten, it is not.
+    #[test]
+    fn a_resubmit_while_the_previous_submit_runs_is_noticed() {
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            // a fence the GPU has not reached stands for a submit still running
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let mut ids = Box::new([0u8; 2]);
+            let (alloc, list) = (ids.as_mut_ptr() as usize, ids.as_mut_ptr() as usize + 1);
+            let queue = 0x10usize as *mut c_void;
+            created_on(list, alloc, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+            {
+                let mut g = STATE.lock().unwrap();
+                let s = g.as_mut().unwrap();
+                let recording = s.recordings[&list];
+                s.last_submit.insert(list, LastSubmit { queue: queue as usize, fence: fence.clone(), value: 1, recording });
+            }
+            let while_running = note_resubmits(queue, &[list as *mut c_void]);
+            fence.Signal(1).unwrap();
+            let after_done = note_resubmits(queue, &[list as *mut c_void]);
+            {
+                // running again, then the list goes: nothing is left to compare with
+                let mut g = STATE.lock().unwrap();
+                g.as_mut().unwrap().last_submit.get_mut(&list).unwrap().value = 2;
+            }
+            forget_list(list);
+            let after_forget = note_resubmits(queue, &[list as *mut c_void]);
+            forget(alloc);
+            assert_eq!(while_running, 1, "a submit while the previous one runs must be noticed");
+            assert_eq!(after_done, 0, "a finished previous submit is not a resubmit");
+            assert_eq!(after_forget, 0, "a forgotten list has no previous submit");
+        }
+    }
+
+    #[test]
+    fn guarded_resubmits_split_at_duplicates_and_preserve_list_order() {
+        let mut ids = Box::new([0u8; 3]);
+        let [a, b, c] = ids.each_mut().map(|id| std::ptr::from_mut(id).cast::<c_void>());
+        let lists = [a, b, a, c, b];
+        let mut submitted = Vec::new();
+        let result = unsafe {
+            submit_serialized(&lists, Duration::ZERO, &mut |chunk| {
+                assert!(chunk.iter().all(|&list| in_flight(list as usize)));
+                submitted.push(chunk.to_vec());
+                true
+            })
+        };
+        assert_eq!(result, Ok(()));
+        assert_eq!(submitted, vec![vec![a, b], vec![a, c, b]]);
+        assert!([a, b, c].iter().all(|&list| !in_flight(list as usize)));
+    }
+
+    #[test]
+    fn guarded_resubmits_reserve_a_whole_batch_and_hold_unmarked_lists() {
+        let mut ids = Box::new([0u8; 2]);
+        let [a, b] = ids.each_mut().map(|id| std::ptr::from_mut(id) as usize);
+        let held = [a as *mut c_void];
+        let (reservation, _) = reserve_submits(&held, Instant::now()).unwrap();
+        let contended = std::thread::spawn(move || unsafe {
+            let lists = [b as *mut c_void, a as *mut c_void];
+            submit_serialized(&lists, Duration::ZERO, &mut |_| panic!("a reserved list cannot be submitted"))
+        }).join().unwrap();
+        assert_eq!(contended, Err(ResubmitError::TimedOut));
+        assert!(!in_flight(b), "a waiting batch holds none of its lists");
+        drop(reservation);
+
+        let mut calls = 0;
+        let first = unsafe {
+            submit_serialized(&[held[0], held[0]], Duration::ZERO, &mut |_| {
+                calls += 1;
+                false
+            })
+        };
+        let retry = unsafe {
+            submit_serialized(&held, Duration::ZERO, &mut |_| {
+                calls += 1;
+                true
+            })
+        };
+        assert!(in_flight(a), "a submitted list without a completion mark is still in flight");
+        forget_list(a);
+        assert_eq!(first, Err(ResubmitError::TrackingFailed));
+        assert_eq!(retry, Err(ResubmitError::TrackingFailed));
+        assert_eq!(calls, 1, "a missing mark stops this batch and future submissions of its lists");
+        assert!(!in_flight(a), "final release clears the tracking failure");
+    }
+
+    #[test]
+    fn guarded_resubmits_refuse_a_pending_fence_and_allow_completion() {
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let mut id = Box::new(0u8);
+            let list = std::ptr::from_mut(id.as_mut()).cast::<c_void>();
+            let mut submitted = 0;
+            let timed_out = submit_serialized(&[list, list], Duration::ZERO, &mut |_| {
+                submitted += 1;
+                let mut g = STATE.lock().unwrap();
+                g.as_mut().unwrap().last_submit.insert(list as usize, LastSubmit {
+                    queue: 0,
+                    fence: fence.clone(),
+                    value: 1,
+                    recording: 0,
+                });
+                true
+            });
+            assert_eq!(submitted, 1, "only the first occurrence reached the native submit");
+            assert_eq!(timed_out, Err(ResubmitError::TimedOut));
+
+            fence.Signal(1).unwrap();
+            let retry = submit_serialized(&[list], Duration::ZERO, &mut |_| {
+                submitted += 1;
+                true
+            });
+            forget_list(list as usize);
+            assert_eq!(retry, Ok(()));
+            assert_eq!(submitted, 2);
         }
     }
 }

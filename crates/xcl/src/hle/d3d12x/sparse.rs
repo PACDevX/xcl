@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::c_void;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 
 use windows::core::Interface;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
@@ -216,9 +216,22 @@ fn zero_runs(pieces: BTreeSet<(usize, usize)>) -> Vec<(usize, usize)> {
 }
 
 struct UploadSlot {
-    alloc: ID3D12CommandAllocator,
+    // A fresh pair can be abandoned before recording. Drop its list before its allocator.
     list: ID3D12GraphicsCommandList,
+    alloc: ID3D12CommandAllocator,
     fence_val: u64,
+}
+
+/// Diagnose native upload Reset hangs by replacing the slot's pair once it has retired.
+fn fresh_upload_slots() -> bool {
+    static FRESH: OnceLock<bool> = OnceLock::new();
+    *FRESH.get_or_init(|| std::env::var("XCL_SPARSE_FRESH_UPLOAD").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// Isolate creation from STATE. REFRESH and native upload submission are unchanged.
+fn prepare_upload_outside_state() -> bool {
+    static OUTSIDE: OnceLock<bool> = OnceLock::new();
+    *OUTSIDE.get_or_init(|| std::env::var("XCL_SPARSE_PREPARE_OUTSIDE_STATE").is_ok_and(|v| v.trim() == "1"))
 }
 
 /// A copy back on `State::rbq`: its list, its readback buffer, the `rb_fence` value it waits
@@ -329,8 +342,8 @@ struct State {
     /// on a Series S profile maps 4.3 GB of physical pages in small pieces: one mapping call
     /// each, ~0.4 ms, held its loading thread ~25 s and its stall watchdog ended it.)
     pending: Vec<usize>,
-    /// placed buffers → the tiles they use (address, pool tile)
-    buffers: FxHashMap<usize, Vec<(usize, (u32, u32))>>,
+    /// placed buffers → (registration id, the tiles they use (address, pool tile))
+    buffers: FxHashMap<usize, (u64, Vec<(usize, (u32, u32))>)>,
     /// reused tiles / decommitted partial pages to clear: (address, bytes)
     to_zero: BTreeSet<(usize, usize)>,
     /// ring-buffered upload staging heap (`STAGING` bytes, persistently mapped)
@@ -358,6 +371,12 @@ struct State {
     runs: BTreeMap<usize, usize>,
     /// reusable buffer for dirty runs in `before_execute` (avoids per-submit heap alloc)
     scratch_runs: Vec<(usize, usize)>,
+    /// Write-watch pages retained when an upload could not be submitted.
+    pending_upload_pages: BTreeSet<usize>,
+    /// `next_slot` is reserved while its replacement is created without STATE.
+    preparing_upload: Option<usize>,
+    /// A submitted list did not get a fence, so its staging and allocator cannot be reused.
+    upload_failed: bool,
 }
 
 impl Drop for State {
@@ -521,6 +540,7 @@ fn plan_ring_chunk(ring_write: u64, want: usize, cap: usize) -> (u64, usize) {
 unsafe impl Send for State {}
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
+static UPLOAD_PREPARED: Condvar = Condvar::new();
 
 /// The state's queue again, outside `STATE` (`queue`). `STATE` is held around D3D12 calls (an
 /// upload's allocator `Reset` in `begin_slot`), and `late_release` asks for the queue from a
@@ -528,12 +548,47 @@ static STATE: Mutex<Option<State>> = Mutex::new(None);
 /// (a list's `Reset`, with `XCL_DRED=1` on every start): the two then waited for each other.
 static QUEUE: Mutex<Option<ID3D12CommandQueue>> = Mutex::new(None);
 
+/// Packed `(live_pools << 32) | free_tiles` so `pool_bytes` never locks `STATE`.
+static POOL_STATS: AtomicU64 = AtomicU64::new(0);
+
+struct ForgetState {
+    placed: Option<FxHashMap<usize, u64>>,
+    deferred: Vec<(usize, u64)>,
+    next_id: u64,
+}
+
+impl ForgetState {
+    fn alloc_placed(&mut self, res: usize) -> u64 {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1).max(1);
+        self.placed.get_or_insert_with(Default::default).insert(res, id);
+        id
+    }
+}
+
+/// Bookkeeping shared between `place_buffer` and `forget_buffer`.
+/// Always acquired after `STATE` when both are held; `forget_buffer` only pairs it with
+/// non-blocking `STATE.try_lock()` so transitioning `placed -> deferred` is atomic under `FORGET`.
+static FORGET: Mutex<ForgetState> = Mutex::new(ForgetState { placed: None, deferred: Vec::new(), next_id: 1 });
+
+fn pack_pool_stats(live_pools: usize, free_tiles: usize) -> u64 {
+    ((live_pools as u64) << 32) | (free_tiles as u64 & 0xFFFF_FFFF)
+}
+
+fn pool_bytes_from_packed(packed: u64) -> (usize, usize) {
+    let pools = (packed >> 32) as usize * POOL_TILES as usize * TILE;
+    let free = (packed & 0xFFFF_FFFF) as usize * TILE;
+    (pools, pools.saturating_sub(free))
+}
+
+fn publish_pool_stats(s: Option<&State>) {
+    let packed = s.map_or(0, |st| pack_pool_stats(st.pools.iter().filter(|p| p.is_some()).count(), st.free.len()));
+    POOL_STATS.store(packed, Ordering::Release);
+}
+
 /// (bytes of video memory in pool heaps, of those mapped) – `XCL_ACTIVITY`
 pub fn pool_bytes() -> (usize, usize) {
-    let g = lock_state();
-    let Some(s) = g.as_ref() else { return (0, 0) };
-    let pools = s.pools.iter().filter(|p| p.is_some()).count() * POOL_TILES as usize * TILE;
-    (pools, pools.saturating_sub(s.free.len() * TILE))
+    pool_bytes_from_packed(POOL_STATS.load(Ordering::Acquire))
 }
 /// commits before the device existed: the pages committed, as disjoint page ranges (start →
 /// end) merged with their neighbours, so a commit or decommit costs O(log n) and not a scan of
@@ -679,6 +734,9 @@ unsafe fn new_state(dev: &ID3D12Device, windows: Vec<(usize, ID3D12Resource)>) -
         waited: FxHashMap::default(),
         runs: BTreeMap::new(),
         scratch_runs: Vec::new(),
+        pending_upload_pages: BTreeSet::new(),
+        preparing_upload: None,
+        upload_failed: false,
     })
 }
 
@@ -745,7 +803,17 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             // its last buffers reaches `forget_buffer`, which takes the lock (#344)
             // (the queue first: `queue()` never answers with one older than the state's)
             let old_queue = QUEUE.lock().unwrap().replace(s.queue.clone());
-            let old = STATE.lock().unwrap().replace(s);
+            let old = {
+                let mut g = STATE.lock().unwrap();
+                {
+                    let mut f = FORGET.lock().unwrap();
+                    f.placed = None;
+                    f.deferred.clear();
+                }
+                let old = g.replace(s);
+                publish_pool_stats(g.as_ref());
+                old
+            };
             drop(old);
             drop(old_queue);
             for (a, b) in std::mem::take(&mut *EARLY.lock().unwrap()) {
@@ -1052,40 +1120,109 @@ impl State {
         }
     }
 
-    /// Acquire the next upload command slot, waiting only if that slot's previous submission is
-    /// still executing on the GPU, then reset its allocator and list.
-    unsafe fn begin_slot(&mut self) -> usize {
+    /// Recheck slot retirement before touching either object. The caller owns STATE.
+    unsafe fn begin_slot(&mut self, prepared: Option<UploadSlot>) -> Option<usize> {
         let idx = self.next_slot;
-        self.next_slot = (self.next_slot + 1) % self.slots.len();
-        let fv = self.slots[idx].fence_val;
-        if fv > 0 && super::real::fence_completed(&self.fence) < fv {
-            self.wait_for(fv);
-            self.reclaim_ring();
-        }
         let slot = &self.slots[idx];
-        let _ = slot.alloc.Reset();
-        let _ = slot.list.Reset(&slot.alloc, None);
-        idx
+        let required = slot.fence_val;
+        let completed = super::real::fence_completed(&self.fence);
+        if self.preparing_upload.is_some() || self.upload_failed || completed == u64::MAX || completed < required {
+            crate::xlog_warn!("sparse: upload slot {idx} unavailable (required {required:#x}, completed {completed:#x})");
+            return None;
+        }
+        let tid = windows_sys::Win32::System::Threading::GetCurrentThreadId();
+        let replacement = match prepared {
+            Some(pair) => Some(pair),
+            None if fresh_upload_slots() => Some(create_upload_slot(&self.dev, idx, tid, required, completed, "with STATE")?),
+            None => None,
+        };
+        if let Some(replacement) = replacement {
+            debug_assert_eq!(replacement.fence_val, required);
+            // The queued work is complete. Keep its fence until the new submit stamps the pair.
+            let retired = std::mem::replace(&mut self.slots[idx], replacement);
+            super::list_x::sync_trace(|| format!("sparse fresh upload tid={tid} slot {idx} release retired pair begin"));
+            drop(retired);
+            super::list_x::sync_trace(|| format!("sparse fresh upload tid={tid} slot {idx} release retired pair end"));
+            self.next_slot = (idx + 1) % self.slots.len();
+            return Some(idx);
+        }
+        super::list_x::sync_trace(|| format!("sparse upload tid={tid} slot {idx} allocator Reset begin required={required:#x} completed={completed:#x}"));
+        let reset = slot.alloc.Reset();
+        super::list_x::sync_trace(|| format!("sparse upload tid={tid} slot {idx} allocator Reset end HRESULT={:#010x}", reset.as_ref().err().map_or(0, |e| e.code().0 as u32)));
+        if let Err(e) = reset {
+            crate::xlog_warn!("sparse: upload slot {idx} allocator Reset failed: {e}");
+            return None;
+        }
+        super::list_x::sync_trace(|| format!("sparse upload tid={tid} slot {idx} list Reset begin required={required:#x} completed={completed:#x}"));
+        let reset = slot.list.Reset(&slot.alloc, None);
+        super::list_x::sync_trace(|| format!("sparse upload tid={tid} slot {idx} list Reset end HRESULT={:#010x}", reset.as_ref().err().map_or(0, |e| e.code().0 as u32)));
+        if let Err(e) = reset {
+            crate::xlog_warn!("sparse: upload slot {idx} list Reset failed: {e}");
+            return None;
+        }
+        self.next_slot = (idx + 1) % self.slots.len();
+        Some(idx)
     }
 
-    /// Close and submit upload slot `idx` asynchronously (NO CPU wait — callers order GPU work
-    /// via `queue.Wait(&self.fence, self.value)`).
-    unsafe fn submit_slot(&mut self, idx: usize) {
-        // the copies on `queue` see every tile mapped (`pending` goes first on the same queue)
-        self.flush_pending();
-        let closed = self.slots[idx].list.Close().is_ok();
-        if closed {
-            if let Ok(l) = self.slots[idx].list.cast::<ID3D12CommandList>() {
-                super::title_textures::own_work(|| {
-                    self.queue.ExecuteCommandLists(&[Some(l)]);
-                });
+    /// Close and submit an upload slot asynchronously. Keep staging and the slot pinned if
+    /// ExecuteCommandLists ran but no fence can be signaled for it.
+    unsafe fn submit_slot(&mut self, idx: usize) -> bool {
+        let list = self.slots[idx].list.Close().and_then(|()| self.slots[idx].list.cast::<ID3D12CommandList>());
+        let list = match list {
+            Ok(list) => list,
+            Err(e) => {
+                self.ring_write = self.ring_submitted;
+                self.upload_failed = true;
+                crate::xlog_warn!("sparse: upload slot {idx} could not close or obtain its list: {e}");
+                return false;
             }
+        };
+        // The copies on the upload queue see every tile mapped.
+        self.flush_pending();
+        super::title_textures::own_work(|| self.queue.ExecuteCommandLists(&[Some(list)]));
+        let next = self.value + 1;
+        if let Err(e) = self.queue.Signal(&self.fence, next) {
+            self.upload_failed = true;
+            crate::xlog_warn!("sparse: upload slot {idx} could not signal fence {next:#x}: {e}");
+            return false;
         }
-        self.signal();
-        self.slots[idx].fence_val = self.value;
+        self.value = next;
+        self.slots[idx].fence_val = next;
         if self.ring_write > self.ring_submitted {
-            self.inflight.push_back((self.value, self.ring_write));
+            self.inflight.push_back((next, self.ring_write));
             self.ring_submitted = self.ring_write;
+        }
+        true
+    }
+
+    /// Determine the byte budget of a single slot. An unavailable slot or ring allocation
+    /// returns the fence that the caller can wait for after releasing STATE.
+    unsafe fn upload_room(&mut self, dirty: bool) -> Option<Result<usize, u64>> {
+        if self.upload_failed {
+            return None;
+        }
+        let completed = super::real::fence_completed(&self.fence);
+        if completed == u64::MAX {
+            crate::xlog_warn!("sparse: upload fence reports device removal");
+            return None;
+        }
+        self.reclaim_ring();
+        let required = self.slots[self.next_slot].fence_val;
+        if required > completed {
+            return Some(Err(required));
+        }
+        if !dirty {
+            return Some(Ok(0));
+        }
+        // Linear copies can skip a tail shorter than PAGE. Scatter can double the payload
+        // for its aligned index table, then skip at most one tail smaller than its next piece.
+        let expansion = if super::scatter::on() { 4 } else { 1 };
+        let room = STAGING.saturating_sub((self.ring_write - self.ring_free) as usize);
+        let bytes = room.saturating_sub(PAGE) / expansion;
+        let minimum = (1 << 20).min(STAGING / expansion);
+        match self.inflight.front() {
+            Some(&(fence, _)) if bytes < minimum => Some(Err(fence)),
+            _ => Some(Ok(bytes)),
         }
     }
 
@@ -1512,11 +1649,14 @@ impl State {
 
     /// Asynchronously zero `runs` (address, bytes) in sparse VRAM using the pre-zeroed `zero_buf`
     /// (zero staging ring bytes consumed, zero CPU stall).
-    unsafe fn upload_zeros(&mut self, runs: &[(usize, usize)]) {
-        if runs.is_empty() || !self.ensure_zero_buf() {
-            return;
+    unsafe fn upload_zeros(&mut self, runs: &[(usize, usize)], prepared: Option<UploadSlot>) -> bool {
+        if runs.is_empty() {
+            return true;
         }
-        let slot_idx = self.begin_slot();
+        if !self.ensure_zero_buf() {
+            return false;
+        }
+        let Some(slot_idx) = self.begin_slot(prepared) else { return false };
         let mut last_wi: Option<usize> = None;
         let zero_buf = self.zero_buf.as_ref().unwrap();
         let list = &self.slots[slot_idx].list;
@@ -1541,17 +1681,17 @@ impl State {
                 done += chunk;
             }
         }
-        self.submit_slot(slot_idx);
+        self.submit_slot(slot_idx)
     }
 
     /// Asynchronously copy `runs` (address, bytes) from the CPU view into sparse VRAM tiles via
     /// the 64 MiB ring staging buffer (zero CPU stall on the common path).
-    unsafe fn upload_dirty(&mut self, runs: &[(usize, usize)]) {
+    unsafe fn upload_dirty(&mut self, runs: &[(usize, usize)], prepared: Option<UploadSlot>) -> bool {
         if runs.is_empty() {
-            return;
+            return true;
         }
-        let Some(p) = self.staging_ptr() else { return };
-        let mut open_slot: Option<usize> = None;
+        let Some(p) = self.staging_ptr() else { return false };
+        let Some(slot_idx) = self.begin_slot(prepared) else { return false };
         let mut last_wi: Option<usize> = None;
         // the copies into the ring (source address, ring offset, bytes), done before their slot is
         // submitted, by the worker threads when there are many
@@ -1559,7 +1699,7 @@ impl State {
         // the many small ones first, together (the windows the open slot's dispatches write are
         // UAVs in it until their first copy)
         let mut uavs: Vec<usize> = Vec::new();
-        let single = self.scatter_small(runs, p, &mut open_slot, &mut jobs, &mut uavs);
+        let single = self.scatter_small(runs, p, slot_idx, &mut jobs, &mut uavs);
         for &(a, n) in single.as_deref().unwrap_or(runs) {
             let mut done = 0usize;
             while done < n {
@@ -1577,16 +1717,7 @@ impl State {
                 let b = self.windows[wi].0;
                 let to_win_end = (b + crate::gpu::uma::WINDOW) - cur;
                 let (aligned, chunk) = plan_ring_chunk(self.ring_write, (n - done).min(to_win_end), STAGING);
-                self.ring_room(aligned + chunk as u64, p, &mut open_slot, &mut jobs);
-                let slot_idx = match open_slot {
-                    Some(idx) => idx,
-                    None => {
-                        uavs.clear();
-                        let idx = self.begin_slot();
-                        open_slot = Some(idx);
-                        idx
-                    }
-                };
+                assert!(aligned + chunk as u64 - self.ring_free <= STAGING as u64, "validated sparse upload exceeded its ring budget");
                 if let Some(k) = uavs.iter().position(|&w| w == wi) {
                     uavs.swap_remove(k);
                     self.slots[slot_idx].list.ResourceBarrier(&[uav_to_copy(&self.windows[wi].1)]);
@@ -1599,38 +1730,14 @@ impl State {
                 done += chunk;
             }
         }
-        if let Some(slot_idx) = open_slot {
-            run_copies(&mut jobs, p);
-            self.submit_slot(slot_idx);
-        }
-    }
-
-    /// Room in the upload ring up to its position `end`: what the GPU is done with is taken back;
-    /// when that is not enough, the open slot is submitted and the GPU waited for.
-    unsafe fn ring_room(&mut self, end: u64, p: *mut u8, open_slot: &mut Option<usize>, jobs: &mut Vec<(usize, usize, usize)>) {
-        if end.saturating_sub(self.ring_free) <= STAGING as u64 {
-            return;
-        }
-        self.reclaim_ring();
-        if end.saturating_sub(self.ring_free) <= STAGING as u64 {
-            return;
-        }
-        if let Some(slot_idx) = open_slot.take() {
-            run_copies(jobs, p);
-            self.submit_slot(slot_idx);
-            self.reclaim_ring();
-        }
-        while end.saturating_sub(self.ring_free) > STAGING as u64 {
-            let Some(&(fv, _)) = self.inflight.front() else { break };
-            self.wait_for(fv);
-            self.reclaim_ring();
-        }
+        run_copies(&mut jobs, p);
+        self.submit_slot(slot_idx)
     }
 
     /// Record the small ones of `runs` as dispatches (`scatter`) that put many of them in their
     /// places at once, in the open slot: the runs left for a copy each (None: all of them). `uavs`
     /// are the windows the open slot's dispatches write.
-    unsafe fn scatter_small(&mut self, runs: &[(usize, usize)], p: *mut u8, open_slot: &mut Option<usize>, jobs: &mut Vec<(usize, usize, usize)>, uavs: &mut Vec<usize>) -> Option<Vec<(usize, usize)>> {
+    unsafe fn scatter_small(&mut self, runs: &[(usize, usize)], p: *mut u8, slot_idx: usize, jobs: &mut Vec<(usize, usize, usize)>, uavs: &mut Vec<usize>) -> Option<Vec<(usize, usize)>> {
         if runs.len() < SCATTER_FROM || !super::scatter::on() {
             return None;
         }
@@ -1643,7 +1750,8 @@ impl State {
         let pass = super::scatter::of(&self.dev)?;
         let ring_va = self.staging.as_ref()?.0.GetGPUVirtualAddress();
         let pieces = super::scatter::pieces(&small, SCATTER_CHUNKS, |a| self.window_index(a).map(|w| (w, self.windows[w].0)));
-        let mut bound = None;
+        let list = self.slots[slot_idx].list.clone();
+        pass.bind(&list);
         for piece in &pieces {
             // the table of the piece and its chunks in one part of the ring
             let bytes = super::scatter::Scatter::bytes(piece.chunks);
@@ -1652,21 +1760,7 @@ impl State {
             if bytes > to_end {
                 at += to_end as u64;
             }
-            self.ring_room(at + bytes as u64, p, open_slot, jobs);
-            let slot_idx = match *open_slot {
-                Some(idx) => idx,
-                None => {
-                    uavs.clear();
-                    let idx = self.begin_slot();
-                    *open_slot = Some(idx);
-                    idx
-                }
-            };
-            let list = self.slots[slot_idx].list.clone();
-            if bound != Some((slot_idx, self.slots[slot_idx].fence_val)) {
-                bound = Some((slot_idx, self.slots[slot_idx].fence_val));
-                pass.bind(&list);
-            }
+            assert!(at + bytes as u64 - self.ring_free <= STAGING as u64, "validated sparse scatter exceeded its ring budget");
             let off = at as usize % STAGING;
             let mut place = p.add(off) as *mut u32;
             let mut data = off + super::scatter::Scatter::data_at(piece.chunks);
@@ -1921,41 +2015,18 @@ pub unsafe fn readback_now(va: usize, len: usize) {
     if len == 0 {
         return;
     }
-    let mut g = lock_state();
-    let Some(s) = g.as_mut() else { return };
+    let g = lock_state();
+    let Some(s) = g.as_ref() else { return };
     if s.window_index(va).is_none() {
         return;
     }
-    let zeroed = zero_runs(std::mem::take(&mut s.to_zero));
-    if !zeroed.is_empty() {
-        for &(a, n) in &zeroed {
-            s.clear_sent_range(a, n);
-        }
-        s.upload_zeros(&zeroed);
+    // Preserve any unsubmitted CPU writes on these pages before copying them back.
+    let pages: Vec<_> = ((va & !(PAGE - 1))..va + len).step_by(PAGE).collect();
+    let (mut g, upload) = upload_pages(g, &pages, false);
+    if upload.is_none() {
+        return;
     }
-    // Preserve any unsubmitted CPU writes on pages overlapping `[va, va + len)`
-    let mut dirty_runs: Vec<(usize, usize)> = Vec::new();
-    let mut pg = va & !(PAGE - 1);
-    let end = va + len;
-    while pg < end {
-        let t = pg & !(TILE - 1);
-        let tile_end = (t + TILE).min(end);
-        if let Some(entry) = s.mapped.get_mut(&t) {
-            let mut p = pg;
-            while p < tile_end {
-                let idx = (p - t) / PAGE;
-                if entry.holes & (1u16 << idx) == 0 {
-                    let bytes = std::slice::from_raw_parts(p as *const u8, PAGE);
-                    scan_page(bytes, p, &mut entry.sent[idx], &mut dirty_runs);
-                }
-                p += PAGE;
-            }
-        }
-        pg = tile_end;
-    }
-    if !dirty_runs.is_empty() {
-        s.upload_dirty(&dirty_runs);
-    }
+    let Some(s) = g.as_mut() else { return };
     s.readback_ranges(&[(va, len)]);
 }
 
@@ -2001,6 +2072,7 @@ pub unsafe fn committed(a: usize, n: usize) {
         return;
     };
     s.commit_range(a, n);
+    publish_pool_stats(Some(s));
 }
 
 /// The title decommitted `[a, a + n)`: tiles whose pages are all uncommitted (whether in one
@@ -2018,6 +2090,7 @@ pub unsafe fn decommitted(a: usize, n: usize) {
         return;
     };
     s.decommit_range(a, n);
+    publish_pool_stats(Some(s));
 }
 
 /// Tiles wait for their mapping call (`State::pending`; read without the lock).
@@ -2076,6 +2149,45 @@ pub fn send_pending() {
 }
 
 impl State {
+    fn drain_forgotten(&mut self) {
+        let batch = {
+            let mut f = FORGET.lock().unwrap();
+            if f.deferred.is_empty() {
+                return;
+            }
+            std::mem::take(&mut f.deferred)
+        };
+        self.drain_forget_batch(batch);
+        publish_pool_stats(Some(self));
+    }
+
+    fn drain_forget_batch(&mut self, batch: Vec<(usize, u64)>) {
+        for (res, id) in batch {
+            self.forget_buffer_inner(res, id);
+        }
+    }
+
+    fn unpin_tiles(&mut self, tiles: Vec<(usize, (u32, u32))>) {
+        for (va, tile) in tiles {
+            if let Some(c) = self.pinned.get_mut(&tile) {
+                *c -= 1;
+                if *c == 0 {
+                    self.pinned.remove(&tile);
+                    self.release_if_unused(va, tile);
+                }
+            }
+        }
+    }
+
+    fn forget_buffer_inner(&mut self, res: usize, id: u64) {
+        if self.buffers.get(&res).is_none_or(|&(cur_id, _)| cur_id != id) {
+            return;
+        }
+        if let Some((_, tiles)) = self.buffers.remove(&res) {
+            self.unpin_tiles(tiles);
+        }
+    }
+
     /// `committed` with the state locked
     unsafe fn commit_range(&mut self, a: usize, n: usize) {
         self.ensure_mapped(a, n, |_| 0xFFFF);
@@ -2244,6 +2356,245 @@ unsafe fn scan_pages(pages: &[PageSlot], out: &mut Vec<(usize, usize)>) {
     }
 }
 
+/// Wait for the upload queue without STATE. The device can be removed during the wait.
+unsafe fn wait_upload_fence(fence: &ID3D12Fence, target: u64) -> bool {
+    use std::time::{Duration, Instant};
+    let started = Instant::now();
+    loop {
+        let completed = super::real::fence_completed(fence);
+        if completed == u64::MAX {
+            crate::xlog_warn!("sparse: device removed while waiting for upload fence {target:#x}");
+            return false;
+        }
+        if completed >= target {
+            return true;
+        }
+        if started.elapsed() >= Duration::from_secs(5) {
+            crate::xlog_warn!("sparse: the queue has not reached upload fence {target:#x} after 5 s (at {completed:#x})");
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// A fresh command list starts in recording state.
+unsafe fn create_upload_slot(
+    dev: &ID3D12Device,
+    idx: usize,
+    tid: u32,
+    required: u64,
+    completed: u64,
+    phase: &str,
+) -> Option<UploadSlot> {
+    super::list_x::sync_trace(|| format!("sparse fresh upload tid={tid} slot {idx} {phase} CreateCommandAllocator begin required={required:#x} completed={completed:#x}"));
+    let allocator: windows::core::Result<ID3D12CommandAllocator> =
+        super::title_textures::own_work(|| dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT));
+    let alloc = match allocator {
+        Ok(alloc) => alloc,
+        Err(e) => {
+            crate::xlog_warn!("sparse: fresh upload slot {idx} CreateCommandAllocator failed HRESULT={:#010x}: {e}", e.code().0 as u32);
+            return None;
+        }
+    };
+
+    super::list_x::sync_trace(|| format!("sparse fresh upload tid={tid} slot {idx} {phase} CreateCommandList begin"));
+    let command_list: windows::core::Result<ID3D12GraphicsCommandList> =
+        super::title_textures::own_work(|| dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None));
+    let list = match command_list {
+        Ok(list) => list,
+        Err(e) => {
+            crate::xlog_warn!("sparse: fresh upload slot {idx} CreateCommandList failed HRESULT={:#010x}: {e}", e.code().0 as u32);
+            return None;
+        }
+    };
+    Some(UploadSlot { list, alloc, fence_val: required })
+}
+
+/// Reserve the current upload turn while a native pair is created. No page pointers or
+/// speculative hash changes survive this unlock. Peers can still map and unmap tiles.
+unsafe fn prepare_upload_released(
+    mut g: MutexGuard<'static, Option<State>>,
+    addresses: &[usize],
+) -> (MutexGuard<'static, Option<State>>, Option<UploadSlot>) {
+    let Some(s) = g.as_mut() else { return (g, None) };
+    let idx = s.next_slot;
+    let required = s.slots[idx].fence_val;
+    let completed = super::real::fence_completed(&s.fence);
+    s.pending_upload_pages.extend(addresses);
+    if completed == u64::MAX || completed < required {
+        return (g, None);
+    }
+    let fence = s.fence.clone();
+    let dev = s.dev.clone();
+    s.preparing_upload = Some(idx);
+    drop(g);
+
+    let tid = windows_sys::Win32::System::Threading::GetCurrentThreadId();
+    let pair = create_upload_slot(&dev, idx, tid, required, completed, "outside STATE");
+
+    g = lock_first(&STATE, &SUBMITS_WAITING);
+    forget_released(&mut g);
+    let valid = g.as_mut().is_some_and(|s| {
+        if s.fence.as_raw() != fence.as_raw() || s.dev.as_raw() != dev.as_raw() || s.preparing_upload != Some(idx) {
+            return false;
+        }
+        s.preparing_upload = None;
+        let completed = super::real::fence_completed(&fence);
+        !s.upload_failed && s.next_slot == idx && s.slots[idx].fence_val == required && completed != u64::MAX && completed >= required
+    });
+    UPLOAD_PREPARED.notify_all();
+
+    if !valid {
+        drop(g);
+        drop(pair);
+        return (lock_state(), None);
+    }
+    (g, pair)
+}
+
+/// Refresh clears before CPU writes. A batch reserves one slot and a bound on ring bytes before
+/// holding pointers into State. Clear/hash changes become visible only after a successful submit.
+unsafe fn upload_pages(
+    mut g: MutexGuard<'static, Option<State>>,
+    mut addresses: &[usize],
+    patient: bool,
+) -> (MutexGuard<'static, Option<State>>, Option<usize>) {
+    let mut bytes_uploaded = 0;
+    let mut prepared_slot = None;
+    loop {
+        let Some(s) = g.as_mut() else { return (g, None) };
+        let clears = !s.to_zero.is_empty();
+        if !clears && addresses.is_empty() {
+            return (g, Some(bytes_uploaded));
+        }
+        if s.preparing_upload.is_some() {
+            s.pending_upload_pages.extend(addresses);
+            let fence = s.fence.clone();
+            let (again, timeout) = UPLOAD_PREPARED
+                .wait_timeout_while(g, std::time::Duration::from_secs(5), |state| {
+                    state.as_ref().is_some_and(|s| s.fence.as_raw() == fence.as_raw() && s.preparing_upload.is_some())
+                })
+                .unwrap();
+            g = again;
+            forget_released(&mut g);
+            if g.as_ref().is_none_or(|s| s.fence.as_raw() != fence.as_raw()) || (timeout.timed_out() && !patient) {
+                return (g, None);
+            }
+            continue;
+        }
+        let room = match s.upload_room(!clears) {
+            Some(Ok(room)) => room,
+            Some(Err(target)) => {
+                // A submit that takes STATE while we wait must also see these CPU writes.
+                s.pending_upload_pages.extend(addresses);
+                let fence = s.fence.clone();
+                drop(g);
+                drop(prepared_slot.take());
+                super::list_x::sync_trace(|| format!("sparse upload fence {target:#x} waiting outside STATE"));
+                let reached = wait_upload_fence(&fence, target);
+                g = lock_first(&STATE, &SUBMITS_WAITING);
+                forget_released(&mut g);
+                let Some(s) = g.as_mut() else { return (g, None) };
+                if s.fence.as_raw() != fence.as_raw() {
+                    return (g, None);
+                }
+                let removed = super::real::fence_completed(&fence) == u64::MAX;
+                if !reached && (!patient || removed) {
+                    s.pending_upload_pages.extend(addresses);
+                    return (g, None);
+                }
+                continue;
+            }
+            None => {
+                s.pending_upload_pages.extend(addresses);
+                return (g, None);
+            }
+        };
+
+        if prepare_upload_outside_state() && prepared_slot.is_none() {
+            let (again, pair) = prepare_upload_released(g, addresses);
+            g = again;
+            if pair.is_none() {
+                return (g, None);
+            }
+            prepared_slot = pair;
+            // Tile commits/decommits could have happened while the device calls ran.
+            continue;
+        }
+
+        if clears {
+            let pieces = std::mem::take(&mut s.to_zero);
+            let runs = zero_runs(pieces.clone());
+            let started = std::time::Instant::now();
+            if !s.upload_zeros(&runs, prepared_slot.take()) {
+                s.to_zero = pieces;
+                s.pending_upload_pages.extend(addresses);
+                return (g, None);
+            }
+            for &(a, n) in &runs {
+                s.clear_sent_range(a, n);
+                bytes_uploaded += n;
+            }
+            PHASES[2].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            PHASES[3].fetch_add(runs.len() as u64, Ordering::Relaxed);
+            continue;
+        }
+
+        let count = addresses.len().min(room / PAGE);
+        if count == 0 {
+            s.pending_upload_pages.extend(addresses);
+            return (g, None);
+        }
+        let scan_started = std::time::Instant::now();
+        let mut pages = Vec::with_capacity(count);
+        for &pg in &addresses[..count] {
+            let tile = pg & !(TILE - 1);
+            let idx = (pg - tile) / PAGE;
+            if let Some(entry) = s.mapped.get_mut(&tile) {
+                if entry.holes & (1u16 << idx) == 0 {
+                    pages.push(PageSlot { pg, slot: &mut entry.sent[idx] });
+                }
+            }
+        }
+        let saved: Vec<_> = pages.iter().map(|p| (p.pg, (*p.slot).as_deref().copied())).collect();
+        let mut runs = std::mem::take(&mut s.scratch_runs);
+        runs.clear();
+        scan_pages(&pages, &mut runs);
+        super::look_stats::scan(pages.len(), &runs);
+        drop(pages);
+        PHASES[1].fetch_add(scan_started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        let upload_started = std::time::Instant::now();
+        let submitted = s.upload_dirty(&runs, prepared_slot.take());
+        PHASES[2].fetch_add(upload_started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        if submitted {
+            bytes_uploaded += runs.iter().map(|r| r.1).sum::<usize>();
+            PHASES[3].fetch_add(runs.len() as u64, Ordering::Relaxed);
+            if !s.pending_upload_pages.is_empty() {
+                for pg in &addresses[..count] {
+                    s.pending_upload_pages.remove(pg);
+                }
+            }
+        } else {
+            for (pg, hashes) in saved {
+                let tile = pg & !(TILE - 1);
+                let idx = (pg - tile) / PAGE;
+                let slot = &mut s.mapped.get_mut(&tile).expect("uploaded tile stays mapped under STATE").sent[idx];
+                if let Some(hashes) = hashes {
+                    *slot.as_deref_mut().expect("scan retains the hash allocation") = hashes;
+                } else {
+                    *slot = None;
+                }
+            }
+            s.pending_upload_pages.extend(addresses);
+        }
+        s.scratch_runs = runs;
+        if !submitted {
+            return (g, None);
+        }
+        addresses = &addresses[count..];
+    }
+}
+
 /// Copies from the title's memory into the staging ring: shared with the worker threads when
 /// there are many bytes.
 unsafe fn run_copies(jobs: &mut Vec<(usize, usize, usize)>, staging: *mut u8) {
@@ -2300,60 +2651,20 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     if s.flush_parked() {
         s.retire_free_pools();
     }
+    publish_pool_stats(Some(s));
     let t_locked = std::time::Instant::now();
     PHASES[0].fetch_add((t_locked - t0).as_micros() as u64, Ordering::Relaxed);
-    let zero_runs = zero_runs(std::mem::take(&mut s.to_zero));
-    for &(a, n) in &zero_runs {
-        s.clear_sent_range(a, n);
-    }
-    let mut dirty_runs = std::mem::take(&mut s.scratch_runs);
-    dirty_runs.clear();
-    let mut pages: Vec<PageSlot> = Vec::with_capacity(dirty.len());
-    let mut i = 0;
-    while i < dirty.len() {
-        let a = dirty[i];
-        let mut n = page;
-        i += 1;
-        while i < dirty.len() && dirty[i] == a + n {
-            n += page;
-            i += 1;
-        }
-        // only what has video memory (committed tiles of a sparse window)
-        let mut x = a;
-        while x < a + n {
-            let t = x & !(TILE - 1);
-            let end = (t + TILE).min(a + n);
-            if let Some(entry) = s.mapped.get_mut(&t) {
-                let mut pg = x & !(PAGE - 1);
-                while pg < end {
-                    let idx = (pg - t) / PAGE;
-                    if entry.holes & (1u16 << idx) == 0 {
-                        pages.push(PageSlot { pg, slot: &mut entry.sent[idx] });
-                    }
-                    pg += PAGE;
-                }
-            }
-            x = end;
-        }
-    }
-    scan_pages(&pages, &mut dirty_runs);
-    let t_scanned = std::time::Instant::now();
-    super::look_stats::scan(pages.len(), &dirty_runs);
-    PHASES[1].fetch_add((t_scanned - t_locked).as_micros() as u64, Ordering::Relaxed);
-    PHASES[3].fetch_add((zero_runs.len() + dirty_runs.len()) as u64, Ordering::Relaxed);
-    // Submit tile clears before CPU writes so overlapping CopyBufferRegion destinations have no WAW hazard.
-    if !zero_runs.is_empty() {
-        s.upload_zeros(&zero_runs);
-    }
-    if !dirty_runs.is_empty() {
-        s.upload_dirty(&dirty_runs);
-    }
-    PHASES[2].fetch_add(t_scanned.elapsed().as_micros() as u64, Ordering::Relaxed);
+    let mut addresses: Vec<_> = std::mem::take(&mut s.pending_upload_pages).into_iter().collect();
+    addresses.extend(dirty.iter().flat_map(|&a| ((a & !(PAGE - 1))..a + page).step_by(PAGE)));
+    addresses.sort_unstable();
+    addresses.dedup();
+    let (mut g, uploaded) = upload_pages(g, &addresses, true);
+    let Some(s) = g.as_mut() else { return };
     {
         static CALLS: AtomicU64 = AtomicU64::new(0);
         static BYTES: AtomicU64 = AtomicU64::new(0);
         static MICROS: AtomicU64 = AtomicU64::new(0);
-        let bytes: usize = zero_runs.iter().chain(dirty_runs.iter()).map(|r| r.1).sum();
+        let bytes = uploaded.unwrap_or(0);
         let n = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
         let b = BYTES.fetch_add(bytes as u64, Ordering::Relaxed) + bytes as u64;
         let us = MICROS.fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed) + t0.elapsed().as_micros() as u64;
@@ -2373,8 +2684,6 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
             );
         }
     }
-    dirty_runs.clear();
-    s.scratch_runs = dirty_runs;
     let q = queue.as_raw() as usize;
     if s.value > 0 && s.waited.get(&q).copied().unwrap_or(0) < s.value {
         let _ = queue.Wait(&s.fence, s.value);
@@ -2387,16 +2696,20 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
 /// description): a reserved resource over the window's tiles there, starting at the 64 KiB
 /// below `va` (returned: its distance from there).
 pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, state: u32, riid: *const windows_sys::core::GUID, ppv: *mut *mut c_void) -> Option<(crate::util::HRESULT, usize)> {
-    let mut g = lock_state();
-    let s = g.as_mut()?;
     let start = va & !(TILE - 1);
     let delta = va - start;
     let bytes = desc.Width as usize;
     if bytes == 0 {
         return None;
     }
-    s.window_index(start)?;
-    s.window_index(va.checked_add(bytes)?.checked_sub(1)?)?;
+    let end_va = va.checked_add(bytes)?.checked_sub(1)?;
+    let device = {
+        let g = lock_state();
+        let s = g.as_ref()?;
+        s.window_index(start)?;
+        s.window_index(end_va)?;
+        s.dev.clone()
+    };
     let mut d = *desc;
     d.Width = (delta + bytes) as u64;
     d.Alignment = 0;
@@ -2410,26 +2723,38 @@ pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_D
     if hr < 0 || ppv.is_null() || (*ppv).is_null() {
         return None;
     }
-    // its tiles: the window's video memory at the same addresses; probe actual OS commitment
-    // so uncommitted pages (e.g. [start, va) or reserved tails) stay marked as holes
-    s.ensure_mapped(start, delta + bytes, |t| query_tile_holes(t));
-    let tiles: Vec<(usize, (u32, u32))> = (start..va + bytes).step_by(TILE).filter_map(|t| s.mapped.get(&t).map(|e| (t, e.pool))).collect();
     let raw = *ppv;
     let res = ID3D12Resource::from_raw_borrowed(&raw)?.clone();
+    let mut g = lock_state();
+    let Some(s) = g.as_mut().filter(|s| {
+        s.dev.as_raw() == device.as_raw() && s.window_index(start).is_some()
+            && s.window_index(end_va).is_some()
+    }) else {
+        drop(g);
+        *ppv = std::ptr::null_mut();
+        drop(ID3D12Resource::from_raw(raw));
+        return None;
+    };
+    // Its tiles are the window's video memory at the same addresses. Probe actual OS
+    // commitment so uncommitted pages stay marked as holes.
+    s.ensure_mapped(start, delta + bytes, |t| query_tile_holes(t));
+    s.drain_forgotten();
+    let tiles: Vec<(usize, (u32, u32))> = (start..va + bytes).step_by(TILE).filter_map(|t| s.mapped.get(&t).map(|e| (t, e.pool))).collect();
     s.map_tiles(&res, start, &tiles);
     for &(_, tile) in &tiles {
         *s.pinned.entry(tile).or_default() += 1;
     }
-    s.buffers.insert(raw as usize, tiles);
+    let id = FORGET.lock().unwrap().alloc_placed(raw as usize);
+    if let Some((_, old_tiles)) = s.buffers.insert(raw as usize, (id, tiles)) {
+        s.unpin_tiles(old_tiles);
+    }
     s.signal();
+    publish_pool_stats(Some(s));
+    drop(g);
     Some((hr, delta))
 }
 
-/// Placed buffers released while `STATE` was held, let go by the next `lock_state`. Held only
-/// to push or take, never across a call out.
-static FORGOTTEN: Mutex<Vec<usize>> = Mutex::new(Vec::new());
-
-/// `STATE`, with the buffers released while it was held let go first.
+/// `STATE`, with the buffers released while it was held unpinned first.
 fn lock_state() -> std::sync::MutexGuard<'static, Option<State>> {
     let mut g = STATE.lock().unwrap();
     forget_released(&mut g);
@@ -2437,36 +2762,33 @@ fn lock_state() -> std::sync::MutexGuard<'static, Option<State>> {
 }
 
 fn forget_released(g: &mut Option<State>) {
-    let gone = std::mem::take(&mut *FORGOTTEN.lock().unwrap());
-    let Some(s) = g.as_mut() else { return };
-    for res in gone {
-        forget_in(s, res);
+    if let Some(s) = g.as_mut() {
+        s.drain_forgotten();
     }
 }
 
-/// A placed buffer is gone: its tiles are not pinned by it any more. This runs from the
-/// resource's last Release, which D3D12 can make while it holds a lock of its own (in a title's
-/// command list Reset), and `before_execute` calls D3D12 with `STATE` held: waiting for `STATE`
-/// here deadlocked the two threads. So it does not wait: with `STATE` held, the holder's next
-/// `lock_state` lets the buffer go.
+/// A placed buffer is gone: its tiles are not pinned by it any more.
+/// Never blocks on `STATE` so resource releases inside D3D12/worker threads cannot deadlock
+/// against a holder of `STATE`. Holds `FORGET` across `remove` -> `STATE.try_lock()` ->
+/// `deferred.push` so a deferred release cannot overtake a concurrent reuse at `res`.
 pub fn forget_buffer(res: usize) {
-    FORGOTTEN.lock().unwrap().push(res);
+    let mut f = FORGET.lock().unwrap();
+    let Some(id) = f.placed.as_mut().and_then(|map| map.remove(&res)) else { return };
     match STATE.try_lock() {
-        Ok(mut g) => forget_released(&mut g),
-        Err(std::sync::TryLockError::WouldBlock) => {}
-        Err(e) => panic!("sparse state: {e}"),
-    }
-}
-
-fn forget_in(s: &mut State, res: usize) {
-    let Some(tiles) = s.buffers.remove(&res) else { return };
-    for (t, tile) in tiles {
-        if let Some(c) = s.pinned.get_mut(&tile) {
-            *c -= 1;
-            if *c == 0 {
-                s.pinned.remove(&tile);
-                s.release_if_unused(t, tile);
+        Ok(mut g) => {
+            let batch = std::mem::take(&mut f.deferred);
+            drop(f);
+            if let Some(s) = g.as_mut() {
+                s.drain_forget_batch(batch);
+                s.forget_buffer_inner(res, id);
+                publish_pool_stats(Some(s));
             }
+        }
+        Err(std::sync::TryLockError::WouldBlock) => {
+            f.deferred.push((res, id));
+        }
+        Err(std::sync::TryLockError::Poisoned(p)) => {
+            panic!("sparse::STATE poisoned: {p}");
         }
     }
 }
@@ -2550,7 +2872,7 @@ mod tests {
             }
             // all of it goes up, then the CPU writes all of it again and only some runs go up
             let all: Vec<(usize, usize)> = tiles.iter().map(|&t| (t, TILE)).collect();
-            s.upload_dirty(&all);
+            s.upload_dirty(&all, None);
             let on_gpu: Vec<Vec<u8>> = tiles.iter().map(|&t| std::slice::from_raw_parts(t as *const u8, TILE).to_vec()).collect();
             let mut runs: Vec<(usize, usize)> = Vec::new();
             for &t in &tiles {
@@ -2571,7 +2893,7 @@ mod tests {
             let small = runs.iter().filter(|r| r.1 < SCATTER_RUN).count() as u64;
             let counts = || (SCATTERED[0].load(Ordering::Relaxed), SCATTERED[1].load(Ordering::Relaxed));
             let before = counts();
-            s.upload_dirty(&runs);
+            s.upload_dirty(&runs, None);
             let after = counts();
             assert!(small > 300 && runs.len() as u64 > small, "{small} small runs of {}", runs.len());
             assert!(after.0 - before.0 >= 3 && after.1 - before.1 >= small, "{} dispatches of {} runs", after.0 - before.0, after.1 - before.1);
@@ -2680,6 +3002,9 @@ mod tests {
                 waited: FxHashMap::default(),
                 runs: BTreeMap::new(),
                 scratch_runs: Vec::new(),
+                pending_upload_pages: BTreeSet::new(),
+                preparing_upload: None,
+                upload_failed: false,
             };
             s.commit_range(base, TILE);
             assert!(s.mapped.contains_key(&base));
@@ -2827,6 +3152,83 @@ mod tests {
         }
     }
 
+    /// `pool_bytes()` answers while the state's lock is held (`xcl-activity` polls it).
+    #[test]
+    fn pool_bytes_is_answered_while_the_state_is_locked() {
+        let answered = returns_while_the_state_is_held(|| { let _ = pool_bytes(); });
+        assert!(answered, "pool_bytes() waited for the sparse state's lock");
+    }
+
+    /// `forget_buffer()` returns without waiting for `STATE` (both for normal unplaced
+    /// resources and for a placed buffer deferred while `STATE` is held).
+    #[test]
+    fn forget_buffer_does_not_block_while_the_state_is_locked() {
+        let sentinel = 0xDEAD_BEEF_0000usize;
+        let held = STATE.lock().unwrap();
+        let id = FORGET.lock().unwrap().alloc_placed(sentinel);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let released = std::thread::spawn(move || {
+            forget_buffer(0x1234_5678);
+            forget_buffer(sentinel);
+            let _ = tx.send(());
+        });
+        let answered = rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok();
+        let (still_placed, deferred) = {
+            let mut f = FORGET.lock().unwrap();
+            let still_placed = f.placed.as_ref().is_some_and(|m| m.contains_key(&sentinel));
+            let deferred = std::mem::take(&mut f.deferred);
+            (still_placed, deferred)
+        };
+        drop(held);
+        released.join().unwrap();
+        assert!(answered, "forget_buffer() waited for the sparse state's lock");
+        assert!(!still_placed, "placed buffer entry should be removed atomically before deferring");
+        assert!(deferred.contains(&(sentinel, id)), "placed buffer release should be deferred when STATE is locked");
+    }
+
+    #[test]
+    fn deferred_forget_does_not_drop_reused_buffer_pointer() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+                let warp: IDXGIAdapter = factory.EnumWarpAdapter().expect("WARP");
+                D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("WARP D3D12 device");
+            }
+            let dev = dev.expect("D3D12 device");
+            let mut s = new_state(&dev, Vec::new()).expect("sparse state");
+
+            let ptr = 0xDEAD_1000usize;
+            let tile_a = (0, 0);
+            let tile_b = (0, 1);
+            *s.pinned.entry(tile_b).or_default() += 1;
+            s.buffers.insert(ptr, (2, vec![(0x10000, tile_b)]));
+            // Stale deferred forget for an older generation `1` at the same pointer must not
+            // remove the reused registration `2` or unpin `tile_b`.
+            s.drain_forget_batch(vec![(ptr, 1)]);
+            assert_eq!(s.buffers.get(&ptr).map(|e| e.0), Some(2));
+            assert!(s.pinned.contains_key(&tile_b));
+
+            // Matching generation `2` removes the buffer and frees `tile_b`.
+            s.drain_forget_batch(vec![(ptr, 2)]);
+            assert!(!s.buffers.contains_key(&ptr));
+            assert!(!s.pinned.contains_key(&tile_b));
+            assert!(s.free.contains(&tile_b));
+            assert!(!s.free.contains(&tile_a));
+        }
+    }
+
+    #[test]
+    fn pack_pool_stats_computes_exact_pool_and_mapped_bytes() {
+        let pool_sz = POOL_TILES as usize * TILE;
+        assert_eq!(pool_bytes_from_packed(pack_pool_stats(0, 0)), (0, 0));
+        assert_eq!(pool_bytes_from_packed(pack_pool_stats(2, 512)), (2 * pool_sz, 2 * pool_sz - 512 * TILE));
+        assert_eq!(pool_bytes_from_packed(pack_pool_stats(1, POOL_TILES as usize)), (pool_sz, 0));
+    }
+
     /// A block freed on one thread while another allocates: its address goes back to the
     /// windows only once it is decommitted (released first, the decommit came after another
     /// thread had the same address again: that thread's writes faulted).
@@ -2878,13 +3280,6 @@ mod tests {
 
     /// A placed buffer released while another thread holds the sparse state: the release does
     /// not wait for the state, and the next `lock_state` lets the buffer go.
-    #[test]
-    fn a_buffer_released_while_the_state_is_held_does_not_wait_for_it() {
-        const RES: usize = 0x7ff0_dead_0000;
-        assert!(returns_while_the_state_is_held(|| forget_buffer(RES)), "forget_buffer waited for the sparse state's lock");
-        drop(lock_state());
-        assert!(!FORGOTTEN.lock().unwrap().contains(&RES));
-    }
 
 
     /// Freeing the last tile in use of a pool and taking a tile again takes the retired pool
@@ -2950,6 +3345,9 @@ mod tests {
                 waited: FxHashMap::default(),
                 runs: BTreeMap::new(),
                 scratch_runs: Vec::new(),
+                pending_upload_pages: BTreeSet::new(),
+                preparing_upload: None,
+                upload_failed: false,
             };
 
             let (first, reused) = s.take_tile().expect("a tile from a new pool");
@@ -3165,6 +3563,9 @@ mod tests {
                 waited: FxHashMap::default(),
                 runs: BTreeMap::new(),
                 scratch_runs: Vec::new(),
+                pending_upload_pages: BTreeSet::new(),
+                preparing_upload: None,
+                upload_failed: false,
             };
 
             // Mirrors `place_buffer`: map both tiles probing real OS page commitment.
@@ -3269,6 +3670,9 @@ mod tests {
                 waited: FxHashMap::default(),
                 runs: BTreeMap::new(),
                 scratch_runs: Vec::new(),
+                pending_upload_pages: BTreeSet::new(),
+                preparing_upload: None,
+                upload_failed: false,
             };
 
             s.commit_range(base, TILE);

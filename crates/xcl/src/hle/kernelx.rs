@@ -223,6 +223,15 @@ pub mod mirrors {
         let (&gpu, &(size, cpu)) = s.gpu.range(..=va).next_back()?;
         (va < gpu + size).then(|| cpu + (va - gpu))
     }
+
+    /// All GPU-view addresses paired with `cpu_va` (reverse of `source`).
+    pub fn gpu_views_of(cpu_va: usize) -> Vec<usize> {
+        let s = STATE.lock().unwrap();
+        s.gpu
+            .iter()
+            .filter_map(|(&gpu, &(size, cpu))| (cpu_va >= cpu && cpu_va < cpu + size).then(|| gpu + (cpu_va - cpu)))
+            .collect()
+    }
 }
 
 /// Graphics memory (MEM_GRAPHICS, committed, no fixed address) comes from the unified
@@ -747,10 +756,27 @@ pub unsafe extern "system" fn VirtualQueryEx(process: HANDLE, address: *const c_
     mem::VirtualQueryEx(process, address, mbi, len)
 }
 
+/// The field at +48 of `XMEM_BASIC_INFORMATION` is 16 bytes; callers inspect more than its low
+/// u32. Zero all of it, then write the flags we know: bit 0 is CPU-cached/readable memory, bit 1
+/// is GPU-accessible memory. Never leave stack garbage in the rest of the field.
+unsafe fn write_xmem_flags(info: *mut c_void, flags: u32) {
+    let p = (info as *mut u8).add(48);
+    std::ptr::write_bytes(p, 0, 16);
+    p.cast::<u32>().write_unaligned(flags);
+}
+
+/// Whether the address is memory the title can use from the GPU: a coherent UMA window, or a
+/// real sparse-VRAM reservation (not merely a PC address that falls in a sparse window by number).
+fn xmem_gpu_visible(address: *const c_void) -> bool {
+    let Some(u) = crate::gpu::uma::get() else { return false };
+    let p = address as usize;
+    u.is_committed(p) || u.is_title_address(p)
+}
+
 /// `BOOL XMemVirtualQuery(HANDLE process, const void* address, XMEM_BASIC_INFORMATION* info)`
-/// (signature from XboxBvhBuilder.dll's call sites): MEMORY_BASIC_INFORMATION plus a field
-/// at +48 whose bits 0-1 the caller requires for "CPU-readable memory" – set to 1 (CPU
-/// cached) for committed readable memory. The caller zeroes the rest.
+/// (signature from XboxBvhBuilder.dll's call sites): MEMORY_BASIC_INFORMATION plus a 16-byte
+/// flags field at +48. Bit 0 marks committed readable memory (CPU cached), bit 1 marks
+/// GPU-accessible UMA / sparse-VRAM memory. The rest is written as zero, not left to the caller.
 pub unsafe extern "system" fn XMemVirtualQuery(process: HANDLE, address: *const c_void, info: *mut c_void) -> BOOL {
     if info.is_null() {
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
@@ -758,7 +784,7 @@ pub unsafe extern "system" fn XMemVirtualQuery(process: HANDLE, address: *const 
     }
     let mbi = info as *mut mem::MEMORY_BASIC_INFORMATION;
     if is_current_process(process) && query_committed_window(address, mbi, std::mem::size_of::<mem::MEMORY_BASIC_INFORMATION>()).is_some() {
-        *(info as *mut u8).add(48).cast::<u32>() = 1;
+        write_xmem_flags(info, 1 | 2);
         return 1;
     }
     if mem::VirtualQueryEx(process, address, mbi, std::mem::size_of::<mem::MEMORY_BASIC_INFORMATION>()) == 0 {
@@ -772,7 +798,8 @@ pub unsafe extern "system" fn XMemVirtualQuery(process: HANDLE, address: *const 
         | mem::PAGE_EXECUTE_WRITECOPY;
     let protect = (*mbi).Protect;
     let cpu = (*mbi).State == mem::MEM_COMMIT && (protect & mem::PAGE_GUARD) == 0 && (protect & READABLE) != 0;
-    *(info as *mut u8).add(48).cast::<u32>() = cpu as u32;
+    let gpu = xmem_gpu_visible(address);
+    write_xmem_flags(info, (cpu as u32) | ((gpu as u32) << 1));
     1
 }
 
@@ -1444,6 +1471,30 @@ unsafe fn move_away(away: &mut Away, old: usize, at: usize, page: usize, in_uma:
     Ok(true)
 }
 
+/// Reserve home storage for `bytes` of title physical pages: sparse UMA first, coherent UMA
+/// only when this `Uma` has no sparse windows (so overflow on runtime layouts never eats the
+/// coherent window's `KEEP` headroom or creates non-lazy homes), and finally plain
+/// `MEM_RESERVE` memory committed on first use (`home_again`).
+unsafe fn alloc_physical_home(u: &crate::gpu::uma::Uma, bytes: usize) -> Option<usize> {
+    if let Some((p, _)) = u.sparse_alloc(bytes, PHYS_PAGE) {
+        return Some(p);
+    }
+    if !u.has_sparse() {
+        if let Some(p) = u.alloc(bytes, PHYS_PAGE) {
+            return Some(p as usize);
+        }
+    }
+    let p = mem::VirtualAlloc(std::ptr::null(), bytes, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        crate::xlog_info!(
+            "AllocateTitlePhysicalPages({}): no room in unified memory – their home is plain memory",
+            bytes / PHYS_PAGE
+        )
+    });
+    (p != 0).then_some(p)
+}
+
 pub unsafe extern "system" fn AllocateTitlePhysicalPages(_p: HANDLE, _t: u32, num: *mut usize, arr: *mut usize) -> BOOL {
     if num.is_null() || arr.is_null() || *num == 0 {
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
@@ -1458,15 +1509,7 @@ pub unsafe extern "system" fn AllocateTitlePhysicalPages(_p: HANDLE, _t: u32, nu
         fnd::SetLastError(fnd::ERROR_NOT_ENOUGH_MEMORY);
         return 0;
     };
-    // (a sparse or plain home is committed when it is used: `home_again`); without room in
-    // unified memory plain memory (pages mapped into the title's own reservations never use
-    // their home: a retail game's 6.1 GB of them did not fit next to its GPU heaps)
-    let block = u.sparse_alloc(bytes, PHYS_PAGE).map(|(p, _)| p).or_else(|| u.alloc(bytes, PHYS_PAGE).map(|p| p as usize)).or_else(|| {
-        let p = mem::VirtualAlloc(std::ptr::null(), bytes, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| crate::xlog_info!("AllocateTitlePhysicalPages({n}): no room in unified memory – their home is plain memory"));
-        (p != 0).then_some(p)
-    });
+    let block = alloc_physical_home(u, bytes);
     let Some(block) = block else {
         crate::xlog_warn!("AllocateTitlePhysicalPages({n}): no room");
         fnd::SetLastError(fnd::ERROR_NOT_ENOUGH_MEMORY);
@@ -1520,12 +1563,56 @@ pub unsafe extern "system" fn FreeTitlePhysicalPages(_p: HANDLE, n: usize, arr: 
     1
 }
 
+/// Per-call detail for `XCL_PHYS_MAP_TRACE=1`, outside the aggregate API cost counters.
+struct PhysicalMapTiming {
+    started: std::time::Instant,
+    locked: std::time::Instant,
+    cleanup: std::time::Instant,
+}
+
+impl PhysicalMapTiming {
+    fn start() -> Option<Self> {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let enabled = *ENABLED.get_or_init(|| keep_last_error(|| std::env::var("XCL_PHYS_MAP_TRACE").is_ok_and(|v| v.trim() == "1")));
+        enabled.then(|| {
+            let started = keep_last_error(std::time::Instant::now);
+            Self { started, locked: started, cleanup: started }
+        })
+    }
+
+    fn report(self, api: &str, pages: usize, result: usize) {
+        keep_last_error(|| {
+            let finished = std::time::Instant::now();
+            let total = finished.duration_since(self.started).as_millis();
+            if total >= 100 {
+                let tid = unsafe { thr::GetCurrentThreadId() };
+                let lock = self.locked.duration_since(self.started).as_millis();
+                let map = self.cleanup.duration_since(self.locked).as_millis();
+                let cleanup = finished.duration_since(self.cleanup).as_millis();
+                crate::xlog_info!("physical map: {api} tid={tid} pages={pages} result={result:#x} total_ms={total} away_wait_ms={lock} map_ms={map} cleanup_ms={cleanup}");
+            }
+        });
+    }
+}
+
 pub unsafe extern "system" fn MapTitlePhysicalPages(va: *mut c_void, n: usize, _t: u32, _p: u32, arr: *mut usize) -> *mut c_void {
-    let _cost = super::api_cost::time(super::api_cost::Call::PhysicalPages);
+    let cost = super::api_cost::time(super::api_cost::Call::PhysicalPages);
+    let mut timing = PhysicalMapTiming::start();
     let mut g = AWAY.lock().unwrap();
+    if let Some(t) = timing.as_mut() {
+        t.locked = keep_last_error(std::time::Instant::now);
+    }
     let away = g.get_or_insert_with(Away::default);
     let r = map_pages(away, va, n, arr);
+    if let Some(t) = timing.as_mut() {
+        t.cleanup = keep_last_error(std::time::Instant::now);
+    }
     give_back_homes(away);
+    drop(g);
+    drop(cost);
+    if let Some(t) = timing {
+        t.report("MapTitlePhysicalPages", n, r as usize);
+    }
     r
 }
 
@@ -1667,7 +1754,7 @@ pub unsafe extern "system" fn XMemMapPhysicalPages(va: *mut c_void, n: usize, ar
 /// `BOOL XMemMapPhysicalPagesScatter(void** addresses, SIZE_T count, ULONG64* pages)`: one 64 KiB
 /// page at each address (page 0: the address is unmapped)
 pub unsafe extern "system" fn XMemMapPhysicalPagesScatter(addresses: *const *mut c_void, n: usize, pages: *mut u64) -> BOOL {
-    let _cost = super::api_cost::time(super::api_cost::Call::PhysicalPages);
+    let cost = super::api_cost::time(super::api_cost::Call::PhysicalPages);
     if addresses.is_null() || pages.is_null() {
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
         return 0;
@@ -1676,7 +1763,11 @@ pub unsafe extern "system" fn XMemMapPhysicalPagesScatter(addresses: *const *mut
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
         return 0;
     }
+    let mut timing = PhysicalMapTiming::start();
     let mut g = AWAY.lock().unwrap();
+    if let Some(t) = timing.as_mut() {
+        t.locked = keep_last_error(std::time::Instant::now);
+    }
     let away = g.get_or_insert_with(Away::default);
     let ok = (0..n).all(|i| {
         // a part of the call that only unmaps
@@ -1688,9 +1779,17 @@ pub unsafe extern "system" fn XMemMapPhysicalPagesScatter(addresses: *const *mut
         }
         !map_pages(away, *addresses.add(i), 1, pages.add(i) as *mut usize).is_null()
     });
+    if let Some(t) = timing.as_mut() {
+        t.cleanup = keep_last_error(std::time::Instant::now);
+    }
     // (a call that failed part way: homes no page went back to)
     away.gone.extend(away.ready.drain());
     give_back_homes(away);
+    drop(g);
+    drop(cost);
+    if let Some(t) = timing {
+        t.report("XMemMapPhysicalPagesScatter", n, ok as usize);
+    }
     ok as BOOL
 }
 
@@ -2601,6 +2700,54 @@ mod tests {
         }
     }
 
+    /// The field at +48 is a 16-byte flags field, not just the low u32: callers that inspect
+    /// GPU visibility or the whole field must not see the buffer's previous contents.
+    #[test]
+    fn xmem_virtual_query_writes_the_whole_flag_field_and_gpu_visibility() {
+        #[repr(C, align(16))]
+        struct Info([u8; 64]);
+
+        unsafe {
+            let proc_ = thr::GetCurrentProcess();
+            let x = 5u32;
+            let mut info = Info([0xCC; 64]);
+            assert_eq!(XMemVirtualQuery(proc_, &x as *const u32 as _, info.0.as_mut_ptr() as _), 1);
+            let flags0 = u32::from_ne_bytes(info.0[48..52].try_into().unwrap());
+            assert_eq!(flags0 & 3, 1, "first flags were {flags0:#x}");
+            assert_eq!(flags0 & 2, 0, "plain stack memory is not GPU-visible");
+            assert!(info.0[52..64].iter().all(|&b| b == 0), "flag tail was not written: {:?}", &info.0[48..64]);
+
+            // A reserved page has no CPU-readable flag either, but the tail is still written.
+            let r = mem::VirtualAlloc(std::ptr::null(), 0x10000, mem::MEM_RESERVE, mem::PAGE_NOACCESS);
+            assert!(!r.is_null());
+            let mut info = Info([0xCC; 64]);
+            assert_eq!(XMemVirtualQuery(proc_, r, info.0.as_mut_ptr() as _), 1);
+            assert_eq!(u32::from_ne_bytes(info.0[48..52].try_into().unwrap()) & 3, 0);
+            assert!(info.0[52..64].iter().all(|&b| b == 0));
+            mem::VirtualFree(r, 0, mem::MEM_RELEASE);
+
+            // Coherent UMA and sparse VRAM are visible to both the CPU and the GPU. Skip only
+            // if UMA is unavailable or has no room: that depends on the machine's address space.
+            let Some(u) = crate::gpu::uma::get() else { return };
+            if let Some(p) = u.alloc(0x1000, 0x1000) {
+                let mut info = Info([0xCC; 64]);
+                assert_eq!(XMemVirtualQuery(proc_, p as *const c_void, info.0.as_mut_ptr() as _), 1);
+                let flags = u32::from_ne_bytes(info.0[48..52].try_into().unwrap());
+                assert_eq!(flags & 3, 3, "UMA memory must be CPU- and GPU-visible: {flags:#x}");
+                assert!(info.0[52..64].iter().all(|&b| b == 0));
+                assert!(u.free(p as usize));
+            }
+            if let Some((s, len)) = u.sparse_alloc(0x1000, 0x1000) {
+                let mut info = Info([0xCC; 64]);
+                assert_eq!(XMemVirtualQuery(proc_, s as *const c_void, info.0.as_mut_ptr() as _), 1);
+                let flags = u32::from_ne_bytes(info.0[48..52].try_into().unwrap());
+                assert_eq!(flags & 2, 2, "sparse VRAM must be reported as GPU-visible: {flags:#x}");
+                assert!(info.0[52..64].iter().all(|&b| b == 0));
+                assert_eq!(u.sparse_release(s), Some(len));
+            }
+        }
+    }
+
     #[test]
     fn physical_pages_in_uma() {
         unsafe {
@@ -3465,7 +3612,8 @@ mod tests {
 
             let mut xinfo = [0u8; 64];
             assert_eq!(XMemVirtualQuery(thr::GetCurrentProcess(), addr, xinfo.as_mut_ptr() as *mut c_void), 1);
-            assert_eq!(u32::from_ne_bytes(xinfo[48..52].try_into().unwrap()), 1);
+            // A coherent UMA window is CPU-readable and GPU-accessible.
+            assert_eq!(u32::from_ne_bytes(xinfo[48..52].try_into().unwrap()), 3);
             assert!(committed_range(base + 0x1000, 0x1000));
             assert!(committed_page(base + 0x1000));
         }
@@ -3493,6 +3641,42 @@ mod tests {
             assert_eq!(VirtualFree(gpu, 0, mem::MEM_RELEASE), 1);
             assert_eq!(mirrors::source(gpu as usize + 0x2_0000), None);
             assert_eq!(VirtualFree(cpu, 0, mem::MEM_RELEASE), 1);
+        }
+    }
+
+    #[test]
+    fn physical_home_overflow_with_sparse_windows_skips_coherent_window() {
+        let u = crate::gpu::uma::Uma::for_runtime(16 << 20).unwrap();
+        let coherent_before = u.used();
+        let mut held = Vec::new();
+        for chunk in [4usize << 30, 1usize << 30, 64usize << 20, 1usize << 20, PHYS_PAGE] {
+            while let Some(p) = u.sparse_reserve(chunk) {
+                held.push(p);
+            }
+        }
+        assert!(u.sparse_alloc(2 * PHYS_PAGE, PHYS_PAGE).is_none());
+
+        unsafe {
+            let home = alloc_physical_home(&u, 2 * PHYS_PAGE).unwrap();
+            assert!(!u.contains(home), "overflow on sparse UMA must not consume the coherent window");
+            assert_eq!(u.used(), coherent_before, "coherent window headroom must stay untouched");
+            assert!(!committed_page(home), "plain-memory home must stay reserved until first use");
+            assert!(lazy_home(home));
+            assert_eq!(mem::VirtualFree(home as *mut c_void, 0, mem::MEM_RELEASE), 1);
+        }
+        for p in held {
+            assert!(u.sparse_release(p).is_some());
+        }
+    }
+
+    #[test]
+    fn physical_home_without_sparse_windows_uses_coherent_window() {
+        let u = crate::gpu::uma::Uma::with_windows(1, 16 << 20).unwrap();
+        assert!(!u.has_sparse());
+        unsafe {
+            let home = alloc_physical_home(&u, 2 * PHYS_PAGE).unwrap();
+            assert!(u.is_committed(home), "coherent-only UMA should still back physical homes");
+            assert!(u.free(home));
         }
     }
 }

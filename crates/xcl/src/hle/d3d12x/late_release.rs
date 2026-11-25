@@ -22,8 +22,14 @@ const SEAL_EVERY: Duration = Duration::from_millis(10);
 /// how often the thread here looks for batches that can go
 const TICK: Duration = Duration::from_millis(4);
 
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+struct PendingRelease {
+    resource: usize,
+    owned_sparse_base: Option<usize>,
+}
+
 struct Batch {
-    dead: Vec<usize>,
+    dead: Vec<PendingRelease>,
     /// (fence, value) a queue: all reached = nothing submitted before the batch closed is left
     marks: Vec<(ID3D12Fence, u64)>,
 }
@@ -32,7 +38,7 @@ struct Batch {
 struct Held {
     /// queue → its fence here and the last value signalled on it
     fences: HashMap<usize, (ID3D12Fence, u64)>,
-    open: Vec<usize>,
+    open: Vec<PendingRelease>,
     sealed: VecDeque<Batch>,
     last_seal: Option<Instant>,
 }
@@ -47,7 +53,7 @@ impl Held {
 
     /// Close the open batch (at most every `SEAL_EVERY`, or `seal_now`) with a fence value on each of `queues`,
     /// and take out the batches every queue is past: the resources to release now.
-    unsafe fn drain(&mut self, queues: &[ID3D12CommandQueue], seal_now: bool) -> Vec<usize> {
+    unsafe fn drain(&mut self, queues: &[ID3D12CommandQueue], seal_now: bool) -> Vec<PendingRelease> {
         if !self.open.is_empty() && (seal_now || self.last_seal.is_none_or(|t| t.elapsed() >= SEAL_EVERY)) {
             let mut marks = Vec::with_capacity(queues.len());
             let mut ok = true;
@@ -86,6 +92,13 @@ impl Held {
 }
 
 static HELD: Mutex<Option<Held>> = Mutex::new(None);
+static SPARSE_FREES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// Keep the address reserved until the worker can decommit it outside driver callbacks.
+pub(super) fn defer_sparse_free(base: usize) {
+    SPARSE_FREES.lock().unwrap().push(base);
+    start_thread();
+}
 
 /// Whether last releases are held (`XCL_LATE_RELEASE=0` turns it off).
 pub fn enabled() -> bool {
@@ -121,8 +134,8 @@ static BUSY: Busy = Busy(Mutex::new(None));
 /// pass a fence value at once): a title that frees the memory under a resource right after its last
 /// `Release` finds it unpinned, as before. Otherwise the thread here lets it go – the driver takes
 /// ~100 us to end a texture, and a title ends thousands of them when it changes places.
-pub unsafe fn hold(res: usize, pinned: bool) {
-    HELD.lock().unwrap().get_or_insert_with(Held::default).open.push(res);
+pub unsafe fn hold(res: usize, pinned: bool, owned_sparse_base: Option<usize>) {
+    HELD.lock().unwrap().get_or_insert_with(Held::default).open.push(PendingRelease { resource: res, owned_sparse_base });
     let start = Instant::now();
     let busy = !pinned || BUSY.is(start);
     if !busy {
@@ -147,11 +160,20 @@ pub unsafe fn hold(res: usize, pinned: bool) {
     // A thread of its own lets the held ones go: the title may release a resource and then
     // wait for its memory without another submit (an imported heap pins the pages under its
     // resources – unmapping them stood still while one was held "until the next submit").
+    start_thread();
+}
+
+fn start_thread() {
     static THREAD: std::sync::Once = std::sync::Once::new();
     THREAD.call_once(|| {
         let _ = std::thread::Builder::new().name("xcl-late-release".into()).spawn(|| loop {
             std::thread::sleep(TICK);
             unsafe { drain_known(false) };
+            let frees = std::mem::take(&mut *SPARSE_FREES.lock().unwrap());
+            // `free` takes the sparse state's lock. A synchronous drain may run inside D3D12.
+            for base in frees {
+                unsafe { super::sparse::free(base) };
+            }
         });
     });
 }
@@ -176,9 +198,13 @@ pub unsafe fn drain_known(seal_now: bool) {
         None => return,
     };
     // (outside the lock: a release may end other objects, whose releases come back here)
-    for res in gone {
-        let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(super::real::orig_fn(res as *mut c_void, 2));
-        f(res as *mut c_void);
+    for release in gone {
+        let res = release.resource as *mut c_void;
+        let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(super::real::orig_fn(res, 2));
+        f(res);
+        if let Some(base) = release.owned_sparse_base {
+            defer_sparse_free(base);
+        }
     }
 }
 
@@ -214,7 +240,8 @@ mod tests {
             let raw = res.unwrap().into_raw() as usize;
 
             let mut held = Held::default();
-            held.open.push(raw);
+            let release = PendingRelease { resource: raw, owned_sparse_base: Some(0x1_0000) };
+            held.open.push(release);
             let queues = [queue.clone()];
             assert!(held.drain(&queues, false).is_empty(), "the queue has not passed the batch's fence value");
             std::thread::sleep(Duration::from_millis(100));
@@ -228,7 +255,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(5));
                 gone = held.drain(&queues, false);
             }
-            assert_eq!(gone, vec![raw], "released once the queue is past the batch");
+            assert_eq!(gone, vec![PendingRelease { resource: raw, owned_sparse_base: Some(0x1_0000) }], "released with its reservation once the queue is past the batch");
             assert!(held.is_empty());
             drop(ID3D12Resource::from_raw(raw as *mut c_void));
         }
@@ -251,8 +278,8 @@ mod tests {
     #[test]
     fn without_queues_a_batch_goes_at_once() {
         let mut held = Held::default();
-        held.open.push(0x1000);
-        assert_eq!(unsafe { held.drain(&[], false) }, vec![0x1000]);
+        held.open.push(PendingRelease { resource: 0x1000, owned_sparse_base: None });
+        assert_eq!(unsafe { held.drain(&[], false) }, vec![PendingRelease { resource: 0x1000, owned_sparse_base: None }]);
         assert!(held.is_empty());
     }
 }
