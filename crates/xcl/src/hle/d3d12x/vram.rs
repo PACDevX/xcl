@@ -25,10 +25,12 @@
 
 use std::collections::HashSet;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
+use windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED;
 
 use crate::util::HRESULT;
 
@@ -927,6 +929,10 @@ unsafe fn reservable(dev: &ID3D12Device, desc: &D3D12_RESOURCE_DESC) -> bool {
     can_reserve(f.Support2.0, samples, m.NumQualityLevels)
 }
 
+fn terminal_reserved_creation_error(hr: HRESULT) -> Option<HRESULT> {
+    (hr == DXGI_ERROR_DEVICE_REMOVED.0).then_some(hr)
+}
+
 /// Canonical physical-backing address for `va`: when `va` lies inside an unmapped GPU mirror view
 /// of title CPU memory (`kernelx::mirrors::source`), map both views to the same backing address so
 /// shared 64 KiB VRAM pages and arenas alias instead of duplicating video memory. If distinct
@@ -960,6 +966,7 @@ unsafe fn place_on_pages(
     riid: *const windows_sys::core::GUID,
     ppv: *mut *mut c_void,
 ) -> Option<HRESULT> {
+    let title_va = va;
     let va = canonical_va(va);
     if desc.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN || desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D {
         return None;
@@ -989,6 +996,18 @@ unsafe fn place_on_pages(
     // lock so concurrent streaming threads, `before_execute`, and `page_bytes` do not serialize.
     let hr = super::real::dev_create_reserved_resource(this, &tiled as *const _ as usize, state as usize, clear as usize, riid, ppv);
     if hr < 0 || (*ppv).is_null() {
+        // A removed device cannot create the fallback resource either.
+        if let Some(removed) = terminal_reserved_creation_error(hr) {
+            static REPORTED: AtomicBool = AtomicBool::new(false);
+            if !REPORTED.swap(true, Ordering::Relaxed) {
+                crate::xlog_error!(
+                    "D3D12.X: device removed while reserving a texture at title VA {title_va:#x} (canonical {va:#x}): HRESULT {:#010x}, state {state:#x}, clear value {}, native desc {tiled:?}",
+                    removed as u32,
+                    !clear.is_null()
+                );
+            }
+            return Some(removed);
+        }
         log(&format!("{hr:#x}"));
         return None;
     }
@@ -1446,6 +1465,14 @@ mod tests {
         assert_eq!(Levels::new(&[(0, 4), (4, 1)], None, 6, 2), None);
         assert_eq!(Levels::new(&[(0, 4), (4, 0)], None, 4, 2), None);
         assert_eq!(Levels::new(&[], None, 0, 1), None);
+    }
+
+    #[test]
+    fn reserved_texture_device_removal_prevents_fallback() {
+        let removed = DXGI_ERROR_DEVICE_REMOVED.0;
+        assert_eq!(terminal_reserved_creation_error(removed), Some(removed));
+        assert_eq!(terminal_reserved_creation_error(crate::util::E_INVALIDARG), None);
+        assert_eq!(terminal_reserved_creation_error(crate::util::E_OUTOFMEMORY), None);
     }
 
     #[test]
