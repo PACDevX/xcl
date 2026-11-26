@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
-use std::sync::{Mutex, Once, OnceLock};
+use std::sync::{Mutex, MutexGuard, Once, OnceLock};
 use std::time::{Duration, Instant};
 
 use windows::core::{Interface, HSTRING, PCSTR, PCWSTR};
@@ -49,6 +49,34 @@ static HWND_RAW: AtomicIsize = AtomicIsize::new(0);
 static PRESENTX: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static PRESENTX_LOCK: Mutex<()> = Mutex::new(());
 
+// The pacing gate comes before PRESENTX_LOCK and PRESENTER. Startup fallback only tries it.
+static PRESENT_PACE: Mutex<Option<Instant>> = Mutex::new(None);
+
+fn parse_present_period(raw: Option<&str>) -> Option<Duration> {
+    let fps: u32 = raw?.trim().parse().ok().filter(|&fps| fps > 0)?;
+    Some(Duration::from_nanos(1_000_000_000_u64.div_ceil(u64::from(fps))))
+}
+
+fn present_period() -> Option<Duration> {
+    static PERIOD: OnceLock<Option<Duration>> = OnceLock::new();
+    *PERIOD.get_or_init(|| parse_present_period(std::env::var("XCL_MAX_PRESENT_FPS").ok().as_deref()))
+}
+
+fn present_wait(period: Duration, last: Option<Instant>, now: Instant) -> Duration {
+    last.map_or(Duration::ZERO, |last| period.saturating_sub(now.saturating_duration_since(last)))
+}
+
+fn wait_for_present_slot(period: Duration) -> MutexGuard<'static, Option<Instant>> {
+    let pace = PRESENT_PACE.lock().unwrap();
+    loop {
+        let wait = present_wait(period, *pace, Instant::now());
+        if wait.is_zero() {
+            return pace;
+        }
+        std::thread::sleep(wait);
+    }
+}
+
 /// command queue #30 PresentX(planeCount, planes, parameters): plane 0's first resource is
 /// the frame; S_OK always (a console present does not fail for the title).
 pub unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, planes: *const u8, _params: *const u8) -> i32 {
@@ -58,8 +86,9 @@ pub unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, pl
         return 0;
     }
     let token = (planes as *const u64).read_unaligned();
+    let mut pace = present_period().filter(|_| enabled()).map(wait_for_present_slot);
     let _present = PRESENTX_LOCK.lock().unwrap();
-    present_x_frame(queue, plane_count, planes);
+    present_x_frame(queue, plane_count, planes, pace.as_deref_mut());
     // The title can use flip statistics to decide when to reuse its buffer.
     // Queue our copy before reporting the flip.
     super::frame::mark_flipped(token);
@@ -115,7 +144,7 @@ fn source_uv_rect(rect: Option<[i32; 4]>, w: u32, h: u32) -> [f32; 4] {
     [0.0, 0.0, 1.0, 1.0]
 }
 
-unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u8) {
+unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u8, pace: Option<&mut Option<Instant>>) {
     let frames = BOUNDARIES.fetch_add(1, Ordering::Relaxed) + 1;
     super::targets::frame_end();
     super::gpu_times::present(frames);
@@ -183,7 +212,7 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
             crate::xlog_info!("frame trace: PresentX #{n} of {res:#x} {:?} – rt binds {}, UAV views {}, copy destination {}, clears {}; most used: {}", d, u[0], u[1], u[2], u[3], busiest.join("; "));
         }
     }
-    present_now(Duration::ZERO, Some((queue as usize, extracted)));
+    present_now(Duration::ZERO, Some((queue as usize, extracted)), pace);
 }
 
 thread_local! {
@@ -361,7 +390,7 @@ pub unsafe fn note_execute(queue: *mut c_void, lists: &[*mut c_void]) {
     }
     // no console present call seen recently → present on submissions (rate limited)
     if now_ms().saturating_sub(LAST_BOUNDARY_MS.load(Ordering::Relaxed)) > 500 {
-        present_now(Duration::from_millis(15), None);
+        present_now(Duration::from_millis(15), None, None);
     }
 }
 
@@ -373,7 +402,7 @@ pub fn on_queue_console_method(_info: &StubInfo, _caller: usize) {
     BOUNDARIES.fetch_add(1, Ordering::Relaxed);
     LAST_BOUNDARY_MS.store(now_ms(), Ordering::Relaxed);
     let _cost = super::look_stats::deep().then(|| crate::hle::api_cost::time(crate::hle::api_cost::Call::Present));
-    unsafe { present_now(Duration::from_millis(4), None) };
+    unsafe { present_now(Duration::from_millis(4), None, None) };
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1045,7 +1074,11 @@ unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: D
     }
 }
 
-unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, Option<[i32; 4]>)>)>) {
+unsafe fn present_now(
+    min_interval: Duration,
+    frame: Option<(usize, Vec<(usize, Option<[i32; 4]>)>)>,
+    title_pace: Option<&mut Option<Instant>>,
+) {
     if IN_PRESENT.with(|c| c.replace(true)) {
         return;
     }
@@ -1057,6 +1090,17 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
     }
     let _reset = Reset;
     let is_frame = frame.is_some();
+    let mut fallback_pace = match present_period().filter(|_| !is_frame) {
+        Some(period) => {
+            let Ok(pace) = PRESENT_PACE.try_lock() else { return };
+            if !present_wait(period, *pace, Instant::now()).is_zero() {
+                return;
+            }
+            Some(pace)
+        }
+        None => None,
+    };
+    let pace = title_pace.or(fallback_pace.as_deref_mut());
     let (queue, raw_planes, mut guard) = if let Some((queue, planes)) = frame {
         (queue, planes, PRESENTER.lock().unwrap())
     } else {
@@ -1286,6 +1330,10 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
         let _in_driver = super::watch::in_driver(super::watch::Call::Present);
         sc.Present(0, DXGI_PRESENT(0)).ok()
     };
+    // Use the actual return time, even on failure, so stalls never build up a burst allowance.
+    if let Some(pace) = pace {
+        *pace = Some(Instant::now());
+    }
     if let Err(e) = presented {
         let e = fence::api_error(&p.dev, "Present", e);
         p.disabled = matches!(&e, FenceError::Removed(_));
@@ -1628,6 +1676,28 @@ impl Drop for Presenter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn present_cap_rounds_up_and_is_off_by_default() {
+        assert_eq!(parse_present_period(None), None);
+        assert_eq!(parse_present_period(Some("0")), None);
+        assert_eq!(parse_present_period(Some("off")), None);
+        let period = parse_present_period(Some(" 30 ")).unwrap();
+        assert_eq!(period, Duration::from_nanos(33_333_334));
+        assert!(period * 30 >= Duration::from_secs(1));
+    }
+
+    #[test]
+    fn present_cap_waits_only_for_the_current_period() {
+        let period = parse_present_period(Some("30")).unwrap();
+        let last = Instant::now();
+        assert_eq!(present_wait(period, None, last), Duration::ZERO);
+        assert_eq!(present_wait(period, Some(last), last + Duration::from_micros(33_333)), Duration::from_nanos(334));
+        assert_eq!(present_wait(period, Some(last), last + period), Duration::ZERO);
+        let resumed = last + Duration::from_secs(5);
+        assert_eq!(present_wait(period, Some(last), resumed), Duration::ZERO);
+        assert_eq!(present_wait(period, Some(resumed), resumed), period);
+    }
 
     #[test]
     fn dumped_texels_of_hdr_and_data_formats_have_a_colour() {
