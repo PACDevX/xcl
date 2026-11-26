@@ -37,6 +37,7 @@ Usage:
       --precompile [--only STAGE]: caches compiled shaders before a run (e.g. --only cs).
           --pipelines also builds compute pipelines and caches them for the next run.
           --used-only skips compute shaders whose pipelines were not used in earlier runs.
+          --with-chain-whole also prebuilds selected split compute shaders' whole-form pipelines.
       --export-hlsl DIR [--count N] [--min-kb N] [--record-hash HEX]: writes deterministic
           compute HLSL for investigation; an exact hash bypasses the size threshold.
       --measure-pso HEX [--repeat N]: times cache-disabled driver compilation of one exact

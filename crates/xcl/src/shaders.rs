@@ -816,6 +816,7 @@ struct ShadersOptions {
     limit: usize,
     only: Option<String>,
     pipelines: bool,
+    with_chain_whole: bool,
     used_only: bool,
     /// `--graphics-records`: the path is a job file of `graphics_in_workers` (`graphics_worker`)
     graphics_records: bool,
@@ -853,6 +854,7 @@ fn parse_args(args: &[String]) -> Result<ShadersOptions, String> {
         limit: usize::MAX,
         only: None,
         pipelines: false,
+        with_chain_whole: false,
         used_only: false,
         graphics_records: false,
         direct: false,
@@ -892,6 +894,7 @@ fn parse_args(args: &[String]) -> Result<ShadersOptions, String> {
             "--limit" => opts.limit = p.parse_usize("--limit")?,
             "--only" => opts.only = Some(p.value("--only")?.to_ascii_lowercase()),
             "--pipelines" => opts.pipelines = true,
+            "--with-chain-whole" => opts.with_chain_whole = true,
             "--used-only" => opts.used_only = true,
             "--graphics-records" => opts.graphics_records = true,
             "--direct" => opts.direct = true,
@@ -908,6 +911,11 @@ fn parse_args(args: &[String]) -> Result<ShadersOptions, String> {
             "--dump" => opts.dump = Some(PathBuf::from(p.value("--dump")?)),
             other => return Err(crate::cli::Parser::unexpected(other)),
         }
+    }
+    if opts.with_chain_whole
+        && (!opts.precompile || !opts.pipelines || opts.export_hlsl.is_some() || opts.measure_pso.is_some() || opts.graphics_records)
+    {
+        return Err("--with-chain-whole requires --precompile --pipelines".into());
     }
     Ok(opts)
 }
@@ -996,7 +1004,14 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
         let used = opts.used_only.then(crate::hle::d3d12x::pso_async::earlier_used_keys);
         // the runtime's key: heap windows with `XCL_HEAP_WINDOWS=1` (`pso::mem_windows`)
         let windows = runtime_windows();
-        return match precompile(&input, opts.limit, windows, opts.split, opts.only.as_deref(), opts.pipelines, used.as_ref(), t0, None) {
+        let pipelines = if opts.with_chain_whole {
+            PipelinePreparation::WithChainWhole
+        } else if opts.pipelines {
+            PipelinePreparation::Standard
+        } else {
+            PipelinePreparation::Disabled
+        };
+        return match precompile(&input, opts.limit, windows, opts.split, opts.only.as_deref(), pipelines, used.as_ref(), t0, None) {
             Ok(()) => 0,
             Err(e) => { eprintln!("xcl shaders: {e}"); 2 }
         };
@@ -1700,12 +1715,12 @@ pub(crate) fn prepare_for_launch(root: &Path, progress: &LaunchPreparation) -> R
         // about two pipelines at a time for one process, whatever the processors)
         if workers > 1 && matches!(input, Input::Pack { .. }) {
             let n = input.len();
-            precompile(input, usize::MAX, windows, None, None, false, None, std::time::Instant::now(), Some(progress))?;
+            precompile(input, usize::MAX, windows, None, None, PipelinePreparation::Disabled, None, std::time::Instant::now(), Some(progress))?;
             if progress.cancel.load(Ordering::Relaxed) { return Err("Shader preparation cancelled".into()); }
             pipelines_in_workers(&pack, windows, workers, n, progress)?;
             continue;
         }
-        precompile(input, usize::MAX, windows, None, None, true, None, std::time::Instant::now(), Some(progress))?;
+        precompile(input, usize::MAX, windows, None, None, PipelinePreparation::WithChainWhole, None, std::time::Instant::now(), Some(progress))?;
     }
     if progress.cancel.load(Ordering::Relaxed) { return Err("Shader preparation cancelled".into()); }
     // `XCL_PREPARE_GRAPHICS=0`: the title builds the graphics pipelines it uses as it goes
@@ -2072,9 +2087,16 @@ fn end_with_parent() {
     });
 }
 
-fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, used: Option<&std::collections::HashSet<u64>>, t0: std::time::Instant, startup: Option<&LaunchPreparation>) -> Result<(), String> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PipelinePreparation {
+    Disabled,
+    Standard,
+    WithChainWhole,
+}
+
+fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, preparation: PipelinePreparation, used: Option<&std::collections::HashSet<u64>>, t0: std::time::Instant, startup: Option<&LaunchPreparation>) -> Result<(), String> {
     if startup.is_none() { end_with_parent(); }
-    let pipelines = if pipelines {
+    let pipelines = if preparation != PipelinePreparation::Disabled {
         let mut p = Pipelines::for_adapter(startup.map_or("auto", |p| p.adapter.as_str()))
             .map_err(|e| format!("No pipeline device: {e}"))?;
         if startup.is_some() && std::env::var_os("XCL_PIPELINE_MAX_KB").is_none() {
@@ -2177,7 +2199,9 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                         Ok(c) => {
                             if let Some(p) = pipelines {
                                 p.make(&c);
-                                if startup.is_some() && c.dispatch_chain.as_ref().is_some_and(|plan| plan.pieces.len() >= 2) {
+                                if preparation == PipelinePreparation::WithChainWhole
+                                    && c.dispatch_chain.as_ref().is_some_and(|plan| plan.pieces.len() >= 2)
+                                {
                                     p.make_one(&c.dxil, &c.samplers, true, None);
                                 }
                             }
@@ -2734,11 +2758,27 @@ mod tests {
         });
         let input = Input::Pack { data, records: records.to_vec() };
         let startup = LaunchPreparation { only: Some(HashSet::new()), ..Default::default() };
-        let error = precompile(&input, 2, 4, Some(false), Some("cs"), false, None, std::time::Instant::now(), Some(&startup)).unwrap_err();
+        let error = precompile(&input, 2, 4, Some(false), Some("cs"), PipelinePreparation::Disabled, None, std::time::Instant::now(), Some(&startup)).unwrap_err();
         // The startup filter skips the valid record without calling the compiler. The invalid
         // record still counts as a failure. Both records advance startup progress exactly once.
         assert!(error.contains("stopped: 1 record failures"), "{error}");
         assert_eq!(startup.done.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn precompile_chain_whole_is_opt_in_and_keeps_the_used_filter() {
+        let args = |flags: &[&str]| flags.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let standard = parse_args(&args(&["--precompile", "--pipelines", "--used-only"])).unwrap();
+        assert!(standard.used_only && !standard.with_chain_whole);
+        let selected = parse_args(&args(&["--with-chain-whole", "--precompile", "--pipelines", "--used-only"])).unwrap();
+        assert!(selected.with_chain_whole && selected.used_only);
+        for invalid in [
+            &["--with-chain-whole", "--precompile"][..],
+            &["--with-chain-whole", "--pipelines"][..],
+            &["--with-chain-whole", "--precompile", "--pipelines", "--measure-pso", "1"][..],
+        ] {
+            assert!(parse_args(&args(invalid)).err().unwrap().contains("requires --precompile --pipelines"));
+        }
     }
 
     #[test]
