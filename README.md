@@ -350,6 +350,15 @@ Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. 
   - `XCL_RUN_SECONDS=n`: the title ends itself after `n` seconds, with the GPU drained and
     `xcl.log` and `report.json` written, so a run of a fixed length can be attached. A value that
     is not a whole number is ignored.
+  - `XCL_PRESENT_TIMING=1`: write CPU timestamps of successful DXGI presents to
+    `present-timing-*.csv` in the title logs, on the same monotonic clock as `xcl.log`.
+    The rows distinguish console `PresentX` from fallback presents. Timestamps are
+    taken before any frame capture readback. A background writer flushes once per
+    second, including heartbeats during stalls. Sequence gaps surface dropped samples.
+    Run `python scripts/present_timing.py <csv> --from 140 --to 200` to report p50,
+    p95, the inverse mean of the slowest 1% of intervals, wall-clock FPS, and
+    stalls of at least 250 ms for a scene window. The CPU samples measure DXGI
+    acceptance. Display scan-out can have a different cadence.
   - `XCL_ACTIVITY=1` (any value turns it on): every 2 seconds `xcl.log` gets an `activity (2 s)`
     line with what the title did in that time (presents, submits, draws, dispatches, frame-event
     waits, DirectStorage requests), and a `memory:` line with the process's commit and the video

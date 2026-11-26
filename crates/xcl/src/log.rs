@@ -49,6 +49,11 @@ pub fn uptime() -> f64 {
     START.get_or_init(Instant::now).elapsed().as_secs_f64()
 }
 
+/// Microseconds on the same monotonic clock as the log, for an already sampled instant.
+pub(crate) fn uptime_us_at(at: Instant) -> u64 {
+    START.get().map_or(0, |start| at.saturating_duration_since(*start).as_micros() as u64)
+}
+
 pub fn init(path: Option<&Path>, level: Level, echo_stderr: bool) {
     START.get_or_init(Instant::now);
     LEVEL.store(level as u8, Ordering::Relaxed);

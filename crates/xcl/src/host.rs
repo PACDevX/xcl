@@ -80,6 +80,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
         std::env::set_var("XCL_UMA_MB", boot.config.uma_mb.to_string());
     }
     crate::state::set_boot(boot.clone());
+    crate::hle::d3d12x::present_timing::start(&boot.logs_dir());
     if let Err(e) = crate::hle::d3d12x::present::preparation::before_guest(&boot) {
         crate::xlog_error!("Shader preparation: {e}");
         eprintln!("xcl: {e}");
@@ -212,6 +213,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
             std::thread::sleep(std::time::Duration::from_secs(secs));
             let (shown, presented) = crate::hle::d3d12x::present::counters();
             crate::xlog_info!("XCL_RUN_SECONDS: {secs} s – ending the title ({shown} frames shown, {presented} PresentX calls)");
+            crate::hle::d3d12x::present_timing::flush();
             crate::report::write_final(None);
             crate::log::flush();
             crate::hle::d3d12x::real::end_title(0);
@@ -255,6 +257,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
     unsafe { crate::hle::kernelx::adopt_title_hooks(&main) };
     crate::report::write_final(None);
     let code = crate::loader::run_main(&main);
+    crate::hle::d3d12x::present_timing::flush();
     crate::xlog_info!("game entry point returned code {code}");
     crate::report::write_final(None);
     crate::log::flush();

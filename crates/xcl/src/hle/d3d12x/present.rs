@@ -1328,19 +1328,24 @@ unsafe fn present_now(
     }
     let presented = {
         let _in_driver = super::watch::in_driver(super::watch::Call::Present);
-        sc.Present(0, DXGI_PRESENT(0)).ok()
+        sc.Present(0, DXGI_PRESENT(0))
     };
     // Use the actual return time, even on failure, so stalls never build up a burst allowance.
-    if let Some(pace) = pace {
-        *pace = Some(Instant::now());
-    }
-    if let Err(e) = presented {
+    let paced_at = pace.map(|pace| {
+        let returned_at = Instant::now();
+        *pace = Some(returned_at);
+        returned_at
+    });
+    if let Err(e) = presented.ok() {
         let e = fence::api_error(&p.dev, "Present", e);
         p.disabled = matches!(&e, FenceError::Removed(_));
         crate::xlog_error!("present: {e}");
         return;
     }
-    p.last = Instant::now();
+    p.last = paced_at.unwrap_or_else(Instant::now);
+    if presented.0 == 0 {
+        super::present_timing::note(p.last, is_frame);
+    }
     if !p.dumps.is_empty() {
         match fence::wait(&p.fence, p.value, &p.dev, Some(p.event), 2000) {
             Ok(()) => {
