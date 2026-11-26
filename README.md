@@ -185,6 +185,13 @@ A **gamepad is recommended**: console games are made for one, and their menus an
   the game's `xcl.toml` turn it off or change the mouse speed. A gamepad and the keyboard / mouse can be
   used together.
 
+For repeatable menu tests, set `XCL_MENU_INPUT_RECORD` to a new CSV file to record foreground
+A and D-pad changes. Set `XCL_MENU_INPUT_REPLAY` to play that CSV from the start of the log clock.
+Optionally set `XCL_MENU_INPUT_FIRST_FRAME_DELAY_MS` to postpone the first recorded press
+until at least that many milliseconds after the first frame is shown. When set,
+`XCL_MENU_INPUT_FOLLOWUP` returns those buttons to real input between tapes and accepts new CSV
+versions at that path after the initial tape finishes.
+
 ## Building and usage
 
 Windows 10/11 x64, Rust (`stable-x86_64-pc-windows-msvc`), the Windows SDK (DXC: `dxcompiler.dll`
@@ -214,6 +221,9 @@ next to `xcl.exe`, directly next to `xcl.exe`, in `%LOCALAPPDATA%\XCL\D3D12\`, o
   can still differ there. With `XCL_DIRECT_DXIL=1` and `XCL_PER_LANE=1`, compute groups
   made up of complete native waves can use the per-lane form for branches on whole-wave masks.
   Test results on other GPUs: [#42](https://github.com/ivall/xcl/issues/42).
+  `XCL_MESH_INDIRECT_SINGLE=1` enables the experimental two-pass translation of a single
+  12-byte indirect mesh dispatch without a count buffer or root argument changes. The arguments must
+  be backed by unified memory. Adapted from [#2092](https://github.com/xcl-dev/xcl/pull/2092).
 
 ```powershell
 cargo build --release --workspace          # target\release\xcl.exe
@@ -235,6 +245,9 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 - For compute shaders that XCL can split, the runtime first tries the saved driver blob for
   the whole shader. A usable blob lets the GPU run it in one dispatch. If the blob is missing
   or the driver rejects it, XCL builds the split pieces.
+- Set `XCL_TWO_PASS_MESH_DISK_CACHE=1` to keep driver blobs from slow two-pass mesh
+  pipeline builds for later runs with the same adapter and driver. This also requires the
+  pipeline disk cache to be enabled.
 - **`--pipelines` size cap**: a compute program whose DXIL is over 8 MiB and that has no saved
   blob is left to the runtime instead of being compiled in the pass — those compiles take tens
   of minutes and gigabytes and stopped the pass on the biggest programs. `XCL_PIPELINE_MAX_KB`

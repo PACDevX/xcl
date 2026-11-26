@@ -41,6 +41,7 @@ static RTVS: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
 static LISTS: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
 static CANDIDATE: Mutex<Option<(usize, usize)>> = Mutex::new(None); // (queue, resource) – resource AddRef'd
 static PRESENTS: AtomicU64 = AtomicU64::new(0);
+static FIRST_FRAME_TIME_US: OnceLock<u64> = OnceLock::new();
 static LAST_FRAME_DUMP: Mutex<Option<FrameDumpSample>> = Mutex::new(None);
 static BOUNDARIES: AtomicU64 = AtomicU64::new(0);
 static LAST_BOUNDARY_MS: AtomicU64 = AtomicU64::new(0);
@@ -421,12 +422,9 @@ impl FrameRate {
     }
 }
 
-/// While XCL compiles shaders (DXC, programs the disk cache did not have – the title draws
-/// nothing with those pipelines meanwhile: after an XCL update the screen stays black while
-/// thousands recompile), the window's title says so:
-/// "XCL – <game> | N FPS | compiling shaders: N running, M done[, Q pipelines queued][, F failed]".
-/// It stays 2 s after the last compile (compiles in the title's own calls come one by one),
-/// then only the game name and presented frame rate remain.
+/// Show current shader and pipeline work in the window title. A lazy stand-in enters the
+/// count only when its build is requested. Keep the counters visible for 2 s after work
+/// finishes, then show just the game name and frame rate.
 unsafe fn show_compiling(hwnd: HWND) {
     static SHOWN: Mutex<Option<String>> = Mutex::new(None);
     static LAST_ACTIVE: Mutex<Option<Instant>> = Mutex::new(None);
@@ -438,9 +436,9 @@ unsafe fn show_compiling(hwnd: HWND) {
         .unwrap()
         .get_or_insert_with(|| FrameRate::new(now, presented))
         .sample(now, presented);
-    let (_, failed, queued) = super::pso_async::counts();
+    let (pipelines, failed) = super::pso_async::window_activity();
     let (running, done) = crate::gpu::recomp::dxc::compile_counts();
-    let active = running > 0 || queued > 0;
+    let active = running > 0 || pipelines > 0;
     let recent = {
         let mut last = LAST_ACTIVE.lock().unwrap();
         if active {
@@ -450,9 +448,9 @@ unsafe fn show_compiling(hwnd: HWND) {
     };
     let title = format!("XCL – {} | {fps:.1} FPS", window_name());
     let text = if recent {
-        let queued = if queued > 0 { format!(", {queued} pipelines queued") } else { String::new() };
+        let pipelines = if pipelines > 0 { format!(", {pipelines} pipelines in progress") } else { String::new() };
         let failed = if failed > 0 { format!(", {failed} failed") } else { String::new() };
-        format!("{title} | compiling shaders: {running} running, {done} done{queued}{failed}")
+        format!("{title} | shaders: {running} compiling, {done} compiled{pipelines}{failed}")
     } else {
         title
     };
@@ -1236,6 +1234,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
     }
     let n = PRESENTS.fetch_add(1, Ordering::Relaxed);
     if n == 0 {
+        let _ = FIRST_FRAME_TIME_US.set((crate::log::uptime() * 1_000_000.0) as u64);
         crate::xlog_info!("present: first game frame shown ({w}x{h})");
     }
 }
@@ -1255,6 +1254,11 @@ fn frame_dump_due() -> bool {
 /// Frames shown so far.
 pub fn presents() -> u64 {
     PRESENTS.load(Ordering::Relaxed)
+}
+
+/// Time of the first shown frame in the log clock, used for opt-in input replay.
+pub(crate) fn first_frame_time_us() -> Option<u64> {
+    FIRST_FRAME_TIME_US.get().copied()
 }
 
 /// Content sampled by an existing `XCL_FRAME_DUMP` readback, not proof of gameplay.
@@ -1688,7 +1692,12 @@ mod frame_dump_tests {
     fn compositor_blends_ui_plane_over_scene_plane() {
         unsafe {
             let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
-            let adapter: IDXGIAdapter = factory.EnumWarpAdapter().unwrap();
+            let Ok(adapter) = factory.EnumWarpAdapter::<IDXGIAdapter1>() else {
+                return crate::gpu::recomp::runner::skip_test("no WARP renderer");
+            };
+            let adapter_desc = adapter.GetDesc1().unwrap();
+            assert_ne!(adapter_desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32, 0, "expected a software adapter");
+            eprintln!("compositor fixture adapter: software, vendor {:#06x}, device {:#06x}", adapter_desc.VendorId, adapter_desc.DeviceId);
             let mut dev: Option<ID3D12Device> = None;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev).unwrap();
             let dev = dev.unwrap();
@@ -1785,10 +1794,11 @@ mod frame_dump_tests {
             let scene = make_tex(4, 4, D3D12_RESOURCE_FLAG_NONE);
             let ui = make_tex(8, 8, D3D12_RESOURCE_FLAG_NONE);
             let out = make_tex(8, 8, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
-            let _up0 = upload_tex(&scene, 4, 4, &|_, _| [0, 0, 255, 255]);
+            let scene_rgba = [32, 64, 128, 255];
+            let _up0 = upload_tex(&scene, 4, 4, &|_, _| scene_rgba);
             let _up1 = upload_tex(&ui, 8, 8, &|x, y| {
                 if y == 2 && x < 4 {
-                    [0, 128, 0, 128]
+                    [0, 64, 0, 128]
                 } else if x < 4 {
                     [0, 0, 0, 0]
                 } else {
@@ -1802,6 +1812,9 @@ mod frame_dump_tests {
                 (ui.clone(), ui.GetDesc(), [0.0, 0.0, 1.0, 1.0]),
             ];
             assert!(comp.record(&dev, &list, &out, 8, 8, DXGI_FORMAT_R8G8B8A8_UNORM, &planes, 0));
+            // As in a paired PresentX capture, sample the planes and then copy their raw bytes.
+            let (scene_rb, scene_fp) = readback_copy(&list, &scene, &planes[0].1).unwrap();
+            let (ui_rb, ui_fp) = readback_copy(&list, &ui, &planes[1].1).unwrap();
             list.ResourceBarrier(&[transition(&out, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
             let out_desc = out.GetDesc();
             let (rb, fp) = readback_copy(&list, &out, &out_desc).unwrap();
@@ -1812,18 +1825,25 @@ mod frame_dump_tests {
             queue.Signal(&fence, 1).unwrap();
             fence::wait(&fence, 1, &dev, None, 5000).unwrap();
 
-            let mut p: *mut c_void = std::ptr::null_mut();
-            rb.Map(0, None, Some(&mut p)).unwrap();
-            let px = |x: usize, y: usize| -> [u8; 4] {
-                let off = fp.Offset as usize + y * fp.Footprint.RowPitch as usize + x * 4;
-                let s = std::slice::from_raw_parts((p as *const u8).add(off), 4);
-                [s[0], s[1], s[2], s[3]]
+            let px = |buffer: &ID3D12Resource, footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT, x: usize, y: usize| {
+                let mut p: *mut c_void = std::ptr::null_mut();
+                buffer.Map(0, None, Some(&mut p)).unwrap();
+                let off = footprint.Offset as usize + y * footprint.Footprint.RowPitch as usize + x * 4;
+                let pixel = (p.cast::<u8>().add(off).cast::<[u8; 4]>()).read();
+                buffer.Unmap(0, None);
+                pixel
             };
-            assert_eq!(px(1, 1), [0, 0, 255, 255], "transparent UI exposes scene plane");
-            assert_eq!(px(6, 1), [255, 0, 0, 255], "opaque UI overwrites scene plane");
-            let blend = px(1, 2);
-            assert!(blend[0] <= 2 && (126..=130).contains(&blend[1]) && (125..=129).contains(&blend[2]) && blend[3] == 255, "unexpected blend {blend:?}");
-            rb.Unmap(0, None);
+            assert_eq!(px(&scene_rb, &scene_fp, 1, 1), scene_rgba, "raw scene channels");
+            assert_eq!(px(&ui_rb, &ui_fp, 1, 1), [0, 0, 0, 0], "raw transparent UI");
+            assert_eq!(px(&ui_rb, &ui_fp, 1, 2), [0, 64, 0, 128], "raw premultiplied UI");
+            assert_eq!(px(&ui_rb, &ui_fp, 6, 1), [255, 0, 0, 255], "raw opaque UI");
+
+            assert_eq!(px(&rb, &fp, 1, 1), scene_rgba, "transparent UI exposes scene plane");
+            assert_eq!(px(&rb, &fp, 6, 1), [255, 0, 0, 255], "opaque UI overwrites scene plane");
+            let blend = px(&rb, &fp, 1, 2);
+            // Premultiplied UI RGB plus scene RGB times (1 - 128/255), rounded to UNORM8.
+            let expected = [16, 96, 64, 255];
+            assert!(blend.into_iter().zip(expected).all(|(actual, want)| actual.abs_diff(want) <= 1), "unexpected blend {blend:?}");
         }
     }
 }

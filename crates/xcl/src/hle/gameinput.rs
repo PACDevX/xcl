@@ -16,6 +16,8 @@
 
 #![allow(non_snake_case)]
 
+mod menu_input;
+
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -270,14 +272,21 @@ extern "system" {
     fn GetWindowThreadProcessId(window: *mut c_void, pid: *mut u32) -> u32;
 }
 
-unsafe fn keyboard() -> u32 {
-    let w = GetForegroundWindow();
-    if w.is_null() {
-        return 0;
+fn title_has_focus() -> bool {
+    // The foreground window may be absent or belong to another process.
+    unsafe {
+        let w = GetForegroundWindow();
+        if w.is_null() {
+            return false;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(w, &mut pid);
+        pid == std::process::id()
     }
-    let mut pid = 0u32;
-    GetWindowThreadProcessId(w, &mut pid);
-    if pid != std::process::id() {
+}
+
+unsafe fn keyboard() -> u32 {
+    if !title_has_focus() {
         return 0;
     }
     const KEYS: [(i32, u32); 10] = [(0x0D, A), (0x20, A), (0x1B, B), (0x08, B), (0x26, DPAD_UP), (0x28, DPAD_DOWN), (0x25, DPAD_LEFT), (0x27, DPAD_RIGHT), (0x09, VIEW), (0x50, MENU)];
@@ -313,6 +322,7 @@ pub fn poll() -> GamepadState {
         super::kbm::apply,
         scripted,
     );
+    s.buttons = menu_input::replay_buttons(s.buttons);
     {
         // the first presses of each button: worth a line (is input arriving at all?)
         static SEEN: AtomicU32 = AtomicU32::new(0);
@@ -516,6 +526,7 @@ fn reading_vtable() -> *const usize {
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 fn new_reading(state: GamepadState) -> *mut Reading {
+    menu_input::record(state.buttons);
     Box::into_raw(Box::new(Reading { vtable: reading_vtable(), refs: AtomicU32::new(1), state, sequence: SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1, timestamp: now_us() }))
 }
 

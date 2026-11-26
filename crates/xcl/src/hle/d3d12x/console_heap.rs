@@ -413,6 +413,11 @@ pub fn start(obj: usize) -> Option<u64> {
     HEAPS.lock().unwrap().iter().find(|h| h.obj == obj).map(|h| h.shadow as u64)
 }
 
+/// Heap class and console address for shaders that index the original heap directly.
+pub(super) fn mesh_heap_base(obj: usize) -> Option<(bool, u32)> {
+    HEAPS.lock().unwrap().iter().find(|h| h.obj == obj).map(|h| (h.sampler, h.shadow as u32))
+}
+
 /// A console slot: where its descriptor goes and its PC descriptors.
 #[derive(Clone, Copy, Debug)]
 pub struct Slot {

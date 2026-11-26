@@ -15,7 +15,8 @@
 //! one recording, so no more allocators are put aside than there are lists.
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
-use std::sync::Mutex;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -26,13 +27,15 @@ use crate::util::HRESULT;
 struct Backing {
     /// PC lists whose recording is on this allocator
     users: HashSet<usize>,
+    /// Native mesh submissions that may use this backing and have no accepted mark yet.
+    mesh_pending: usize,
     /// queue → (fence, value after the last submit of one of them)
     marks: HashMap<usize, (ID3D12Fence, u64)>,
 }
 
 impl Backing {
     unsafe fn free(&self) -> bool {
-        self.users.is_empty() && self.marks.values().all(|(f, v)| f.GetCompletedValue() >= *v)
+        self.users.is_empty() && self.mesh_pending == 0 && self.marks.values().all(|(f, v)| f.GetCompletedValue() >= *v)
     }
 }
 
@@ -54,6 +57,8 @@ struct State {
     /// PC list → recordings so far (a Reset or creation starts the next one)
     recordings: HashMap<usize, u64>,
     resubmits: u64,
+    mesh_recordings: HashMap<usize, Arc<MeshProgress>>,
+    mesh_reserved: HashSet<usize>,
 }
 
 struct LastSubmit {
@@ -66,6 +71,50 @@ struct LastSubmit {
 unsafe impl Send for State {}
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
+static MESH_SUBMIT_AVAILABLE: Condvar = Condvar::new();
+
+#[derive(Clone)]
+pub(super) struct MeshCompletion {
+    pub(super) fence: ID3D12Fence,
+    pub(super) value: u64,
+}
+
+#[derive(Default)]
+pub(super) struct MeshProgress {
+    submission: Mutex<MeshSubmission>,
+}
+
+#[derive(Default)]
+struct MeshSubmission {
+    reserved: bool,
+    completion: Option<MeshCompletion>,
+}
+
+impl MeshProgress {
+    /// Only ended recordings may use this. None means the native submit has not yet been marked.
+    pub(super) fn retirement_state(&self) -> Option<Option<MeshCompletion>> {
+        let submit = self.submission.lock().unwrap();
+        (!submit.reserved).then(|| submit.completion.clone())
+    }
+}
+
+/// Scratch follows this recording even when the same native list is reset or released.
+pub(super) fn track_mesh_recording(list: usize) -> Option<Arc<MeshProgress>> {
+    let mut state = STATE.lock().unwrap();
+    let state = state.as_mut()?;
+    if !state.of_list.contains_key(&list) {
+        return None;
+    }
+    Some(state.mesh_recordings.entry(list).or_default().clone())
+}
+
+pub(super) fn end_mesh_recording(list: usize, progress: &Arc<MeshProgress>) {
+    let mut state = STATE.lock().unwrap();
+    let Some(state) = state.as_mut() else { return };
+    if state.mesh_recordings.get(&list).is_some_and(|other| Arc::ptr_eq(progress, other)) {
+        state.mesh_recordings.remove(&list);
+    }
+}
 
 /// `XCL_ALLOC_SWAP=0` turns it off.
 pub fn enabled() -> bool {
@@ -91,6 +140,7 @@ pub(super) fn forget_list(list: usize) {
     let Some(s) = g.as_mut() else { return };
     s.last_submit.remove(&list);
     s.recordings.remove(&list);
+    s.mesh_recordings.remove(&list);
     if let Some(backing) = s.of_list.remove(&list) {
         if let Some(b) = s.backings.get_mut(&backing) {
             b.users.remove(&list);
@@ -112,6 +162,7 @@ pub fn reset_list(list: usize, alloc: usize, ty: i32, reset: impl FnOnce(usize) 
         s.types.insert(alloc, ty);
     }
     move_list(s, list, backing);
+    s.mesh_recordings.remove(&list);
     *s.recordings.entry(list).or_default() += 1;
     hr
 }
@@ -141,6 +192,7 @@ pub fn created_on(list: usize, raw: usize, ty: i32) {
     let s = g.get_or_insert_with(State::default);
     s.types.entry(raw).or_insert(ty);
     move_list(s, list, raw);
+    s.mesh_recordings.remove(&list);
     *s.recordings.entry(list).or_default() += 1;
 }
 
@@ -182,31 +234,37 @@ pub unsafe fn note_resubmits(queue: *mut c_void, lists: &[*mut c_void]) -> usize
 /// submitted again before that; `title_list` records the title's next recording elsewhere).
 pub fn in_flight(list: usize) -> bool {
     let g = STATE.lock().unwrap();
-    g.as_ref().and_then(|s| s.last_submit.get(&list)).is_some_and(|l| unsafe { l.fence.GetCompletedValue() } < l.value)
+    g.as_ref().is_some_and(|s| {
+        s.mesh_reserved.contains(&list) || s.last_submit.get(&list)
+            .is_some_and(|l| unsafe { l.fence.GetCompletedValue() } < l.value)
+    })
 }
 
 /// `lists` were just submitted to `queue`.
 pub unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void]) {
+    let _ = mark_executed(queue, lists);
+}
+
+unsafe fn mark_executed(queue: *mut c_void, lists: &[*mut c_void]) -> Option<MeshCompletion> {
     if !enabled() || queue.is_null() {
-        return;
+        return None;
     }
     // (every submit is marked, also of lists this module does not track – the PC lists behind
     // console lists – so note_resubmits sees them all)
     let mut g = STATE.lock().unwrap();
     let s = g.get_or_insert_with(State::default);
-    let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return };
+    let q = ID3D12CommandQueue::from_raw_borrowed(&queue)?;
     let key = queue as usize;
     if !s.fences.contains_key(&key) {
         let mut dev: Option<ID3D12Device> = None;
-        let Some(f) = q.GetDevice(&mut dev).ok().and(dev).and_then(|d| d.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok()) else { return };
+        let f = q.GetDevice(&mut dev).ok().and(dev).and_then(|d| d.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok())?;
         s.fences.insert(key, (f, 0));
     }
     let (fence, value) = {
         let (f, v) = s.fences.get_mut(&key).unwrap();
-        if q.Signal(&*f, *v + 1).is_err() {
-            return;
-        }
-        *v += 1;
+        let next = v.checked_add(1).filter(|&v| v != u64::MAX)?;
+        q.Signal(&*f, next).ok()?;
+        *v = next;
         (f.clone(), *v)
     };
     for &l in lists {
@@ -216,6 +274,169 @@ pub unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void]) {
         let recording = s.recordings.get(&(l as usize)).copied().unwrap_or(0);
         s.last_submit.insert(l as usize, LastSubmit { queue: key, fence: fence.clone(), value, recording });
     }
+    Some(MeshCompletion { fence, value })
+}
+
+fn fence_finished(done: u64, value: u64) -> bool {
+    done != u64::MAX && done >= value
+}
+
+/// Completion of the reservation protects the scratch of the exact submit, even if a Reset
+/// or Release removes the recording from the native-list map meanwhile.
+struct MeshReservation {
+    progress: Vec<MeshRecording>,
+    previous: Vec<(usize, MeshCompletion)>,
+}
+
+struct MeshRecording {
+    list: usize,
+    backing: usize,
+    progress: Arc<MeshProgress>,
+}
+
+#[derive(Debug)]
+enum MeshReserveError {
+    UnknownBacking,
+    Timeout,
+}
+
+fn reserve_mesh(lists: &[*mut c_void], until: Instant) -> Result<MeshReservation, MeshReserveError> {
+    let mut g = STATE.lock().unwrap();
+    loop {
+        let s = g.get_or_insert_with(State::default);
+        if lists.iter().all(|&list| !s.mesh_reserved.contains(&(list as usize))) {
+            let progress = lists.iter().filter_map(|&list| {
+                let list = list as usize;
+                s.mesh_recordings.get(&list).map(|p| {
+                    let backing = s.of_list.get(&list).copied().ok_or(MeshReserveError::UnknownBacking)?;
+                    Ok(MeshRecording { list, backing, progress: p.clone() })
+                })
+            }).collect::<Result<Vec<_>, MeshReserveError>>()?;
+            let previous = progress.iter().filter_map(|r| {
+                s.last_submit.get(&r.list).map(|mark| (r.list, MeshCompletion {
+                    fence: mark.fence.clone(), value: mark.value,
+                }))
+            }).collect();
+            for recording in &progress {
+                recording.progress.submission.lock().unwrap().reserved = true;
+                s.mesh_reserved.insert(recording.list);
+                s.backings.get_mut(&recording.backing).unwrap().mesh_pending += 1;
+            }
+            return Ok(MeshReservation { progress, previous });
+        }
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(MeshReserveError::Timeout);
+        }
+        (g, _) = MESH_SUBMIT_AVAILABLE.wait_timeout(g, left).unwrap();
+    }
+}
+
+fn stop_mesh_submission(reason: String, status: u32) -> ! {
+    crate::xlog_error!("D3D12.X: two-pass mesh submit stopped: {reason}");
+    super::real::stop_if_device_removed();
+    crate::report::write_final(Some(reason));
+    crate::log::flush();
+    std::process::exit(status as i32);
+}
+
+unsafe fn submit_mesh_chunk(
+    queue: *mut c_void, lists: &[*mut c_void],
+    submit: &mut impl FnMut(&[*mut c_void]),
+    after: &mut impl FnMut(&[*mut c_void]),
+) {
+    let until = Instant::now() + Duration::from_secs(2);
+    let reservation = reserve_mesh(lists, until).unwrap_or_else(|error| {
+        let (reason, status) = match error {
+            MeshReserveError::UnknownBacking => ("a mesh recording lost its native allocator", 0x8000_4005),
+            MeshReserveError::Timeout => ("could not reserve the mesh recordings in time", 0x8007_05b4),
+        };
+        stop_mesh_submission(format!("queue {queue:p}: {reason}"), status)
+    });
+    for (list, mark) in reservation.previous {
+        loop {
+            let done = mark.fence.GetCompletedValue();
+            if done == u64::MAX {
+                stop_mesh_submission(format!("device removed waiting for mesh list {list:#x}"), 0x887a_0005);
+            }
+            if fence_finished(done, mark.value) {
+                break;
+            }
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                stop_mesh_submission(format!("mesh list {list:#x} fence has {done:#x}, expected {:#x}", mark.value), 0x8007_05b4);
+            }
+            std::thread::sleep(left.min(Duration::from_millis(1)));
+        }
+    }
+    submit(lists);
+    if reservation.progress.is_empty() {
+        executed(queue, lists);
+        after(lists);
+        return;
+    }
+    let completion = mark_executed(queue, lists).unwrap_or_else(|| {
+        stop_mesh_submission(format!("queue {queue:p} did not accept a mesh completion signal"), 0x8000_4005)
+    });
+    after(lists);
+    let mut g = STATE.lock().unwrap();
+    let state = g.as_mut().unwrap();
+    finish_mesh_marks(state, reservation.progress, queue as usize, &completion);
+    drop(g);
+    MESH_SUBMIT_AVAILABLE.notify_all();
+}
+
+fn finish_mesh_marks(state: &mut State, recordings: Vec<MeshRecording>, queue: usize, mark: &MeshCompletion) {
+    for recording in recordings {
+        let backing = state.backings.entry(recording.backing).or_default();
+        backing.mesh_pending = backing.mesh_pending.saturating_sub(1);
+        // Another list on this backing may have accepted a later signal while this
+        // submission was in its post-submit callbacks.
+        backing.marks.entry(queue).and_modify(|(fence, value)| {
+            if fence.as_raw() == mark.fence.as_raw() {
+                *value = (*value).max(mark.value);
+            }
+        }).or_insert_with(|| (mark.fence.clone(), mark.value));
+        let mut submit = recording.progress.submission.lock().unwrap();
+        submit.completion = Some(mark.clone());
+        submit.reserved = false;
+        state.mesh_reserved.remove(&recording.list);
+    }
+}
+
+/// Leave ordinary submissions alone. Actual mesh recordings cannot reuse scratch while their
+/// prior native execution is live, including across queues or twice in one caller's batch.
+pub(super) unsafe fn submit_with_mesh_tracking(
+    queue: *mut c_void, lists: &[*mut c_void],
+    mut submit: impl FnMut(&[*mut c_void]), mut after: impl FnMut(&[*mut c_void]),
+) {
+    let mesh: HashSet<_> = if super::bind::mesh_indirect::on() {
+        let g = STATE.lock().unwrap();
+        lists.iter().filter_map(|&list| {
+            let list = list as usize;
+            g.as_ref().is_some_and(|s| s.mesh_recordings.contains_key(&list) || s.mesh_reserved.contains(&list)).then_some(list)
+        }).collect()
+    } else {
+        HashSet::new()
+    };
+    if mesh.is_empty() {
+        submit(lists);
+        executed(queue, lists);
+        after(lists);
+        return;
+    }
+    let mut seen = HashSet::new();
+    let mut first = 0;
+    for (i, &list) in lists.iter().enumerate() {
+        let list = list as usize;
+        if mesh.contains(&list) && !seen.insert(list) {
+            submit_mesh_chunk(queue, &lists[first..i], &mut submit, &mut after);
+            first = i;
+            seen.clear();
+            seen.insert(list);
+        }
+    }
+    submit_mesh_chunk(queue, &lists[first..], &mut submit, &mut after);
 }
 
 /// Whether the GPU may still run a recording made on the title's allocator `alloc`.
@@ -223,7 +444,8 @@ pub(super) unsafe fn allocator_in_flight(alloc: usize) -> bool {
     let g = STATE.lock().unwrap();
     let Some(s) = g.as_ref() else { return false };
     let mine = s.cur.get(&alloc).into_iter().chain(s.aside.get(&alloc).into_iter().flatten()).chain([&alloc]);
-    let busy = mine.filter_map(|b| s.backings.get(b)).any(|b| b.marks.values().any(|(f, v)| f.GetCompletedValue() < *v));
+    let busy = mine.filter_map(|b| s.backings.get(b))
+        .any(|b| b.mesh_pending != 0 || b.marks.values().any(|(f, v)| f.GetCompletedValue() < *v));
     busy
 }
 
@@ -330,6 +552,112 @@ unsafe fn title_reset_in(s: &mut State, alloc: *mut c_void, mut reset: impl FnMu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mesh_completion_is_unavailable_while_the_recording_is_reserved() {
+        let progress = MeshProgress::default();
+        assert!(matches!(progress.retirement_state(), Some(None)));
+        progress.submission.lock().unwrap().reserved = true;
+        assert!(progress.retirement_state().is_none());
+        assert!(fence_finished(14, 14));
+        assert!(!fence_finished(13, 14));
+        assert!(!fence_finished(u64::MAX, 14));
+    }
+
+    #[test]
+    fn a_mesh_reservation_keeps_its_backing_through_native_address_reuse() {
+        use std::cell::Cell;
+        use std::mem::{offset_of, size_of};
+
+        #[repr(C)]
+        struct Fence {
+            vtable: *const usize,
+            value: Cell<u64>,
+            refs: Cell<u32>,
+        }
+        unsafe extern "system" fn completed(this: *mut c_void) -> u64 {
+            (*this.cast::<Fence>()).value.get()
+        }
+        unsafe extern "system" fn add(this: *mut c_void) -> u32 {
+            let refs = &(*this.cast::<Fence>()).refs;
+            refs.set(refs.get() + 1);
+            refs.get()
+        }
+        unsafe extern "system" fn release(this: *mut c_void) -> u32 {
+            let refs = &(*this.cast::<Fence>()).refs;
+            refs.set(refs.get() - 1);
+            refs.get()
+        }
+        extern "system" fn unexpected_call() { std::process::abort(); }
+
+        const SLOT: usize = size_of::<usize>();
+        let mut vtable = [unexpected_call as usize; size_of::<ID3D12Fence_Vtbl>() / SLOT];
+        vtable[offset_of!(ID3D12Fence_Vtbl, GetCompletedValue) / SLOT] = completed as usize;
+        vtable[offset_of!(ID3D12Fence_Vtbl, base__.base__.base__.base__.AddRef) / SLOT] = add as usize;
+        vtable[offset_of!(ID3D12Fence_Vtbl, base__.base__.base__.base__.Release) / SLOT] = release as usize;
+        let mut fence = Fence { vtable: vtable.as_ptr(), value: Cell::new(0), refs: Cell::new(1) };
+        let mark = MeshCompletion {
+            fence: unsafe { ID3D12Fence::from_raw(std::ptr::from_mut(&mut fence).cast()) },
+            value: 42,
+        };
+        let newer = MeshCompletion { fence: mark.fence.clone(), value: 43 };
+        let mut ids = Box::new([0u8; 4]);
+        let list = ids.as_mut_ptr() as usize;
+        let (old_alloc, new_alloc, other) = (list + 1, list + 2, list + 3);
+        created_on(other, old_alloc, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+        let newer_recording = track_mesh_recording(other).unwrap();
+        created_on(list, old_alloc, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+        let original = track_mesh_recording(list).unwrap();
+        let submit = [list as *mut c_void];
+        let reservation = reserve_mesh(&submit, Instant::now()).unwrap();
+
+        assert!(original.retirement_state().is_none(), "submit has no accepted completion yet");
+        assert!(in_flight(list), "do not re-use a PC list while the driver is accepting it");
+        assert!(reserve_mesh(&submit, Instant::now()).is_err());
+        created_on(list, new_alloc, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+        let replacement = track_mesh_recording(list).unwrap();
+        end_mesh_recording(list, &original);
+        let newer_submission = reserve_mesh(&[other as *mut c_void], Instant::now()).unwrap();
+        {
+            let mut g = STATE.lock().unwrap();
+            finish_mesh_marks(g.as_mut().unwrap(), newer_submission.progress, 1, &newer);
+        }
+        forget_list(other);
+        let (reserved, new_unmarked, old_mark, pending) = {
+            let mut g = STATE.lock().unwrap();
+            let s = g.as_mut().unwrap();
+            let reserved = !unsafe { s.backings[&old_alloc].free() };
+            finish_mesh_marks(s, reservation.progress, 1, &mark);
+            let old = &s.backings[&old_alloc];
+            (reserved, s.backings[&new_alloc].marks.is_empty(), old.marks.get(&1).map(|m| m.1), !unsafe { old.free() })
+        };
+        let original_mark = original.retirement_state().flatten().map(|m| m.value);
+        let replacement_unmarked = matches!(replacement.retirement_state(), Some(None));
+        let value = mark.value;
+        let newer_value = newer.value;
+        let newer_mark = newer_recording.retirement_state().flatten().map(|m| m.value);
+        fence.value.set(value);
+        let newer_still_pending = !unsafe { STATE.lock().unwrap().as_ref().unwrap().backings[&old_alloc].free() };
+        fence.value.set(newer_value);
+        let completed = unsafe { STATE.lock().unwrap().as_ref().unwrap().backings[&old_alloc].free() };
+
+        // Release the synthetic COM object from the globals before checking the result.
+        forget_list(list);
+        unsafe { forget(old_alloc); forget(new_alloc); }
+        drop(original);
+        drop(newer_recording);
+        drop(mark);
+        drop(newer);
+        assert!(reserved, "old backing must remain reserved");
+        assert!(pending, "the old backing now waits for its native fence");
+        assert!(new_unmarked && replacement_unmarked);
+        assert_eq!(old_mark, Some(newer_value), "the older callback finished last on the same fence");
+        assert_eq!(original_mark, Some(value));
+        assert_eq!(newer_mark, Some(newer_value));
+        assert!(newer_still_pending, "the newer native submit can still use the old allocator");
+        assert!(completed);
+        assert_eq!(fence.refs.get(), 0);
+    }
 
     #[test]
     fn a_spare_whose_reset_fails_stays_available_for_retry() {

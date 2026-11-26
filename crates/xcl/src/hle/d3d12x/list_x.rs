@@ -108,6 +108,17 @@ pub(super) fn tracked_list_type(list: *mut c_void) -> Option<D3D12_COMMAND_LIST_
     LISTS.lock().unwrap().as_ref()?.get(&(list as usize))?.list_type
 }
 
+/// The two-pass rewrite needs a direct recording and cannot replace a predicated draw.
+pub(super) fn mesh_indirect_can_record(list: *mut c_void) -> bool {
+    LISTS.lock().unwrap().as_ref().and_then(|lists| lists.get(&(list as usize)))
+        .is_some_and(|s| s.list_type == Some(D3D12_COMMAND_LIST_TYPE_DIRECT) && s.predication.is_none())
+}
+
+/// Bind the temporary pipeline without changing the title-visible pipeline state.
+pub(super) unsafe fn bind_mesh_internal_pipeline(list: *mut c_void, pso: *mut c_void) {
+    pc::<unsafe extern "system" fn(*mut c_void, *mut c_void)>(list, PC_SET_PIPELINE_STATE)(list, pso);
+}
+
 pub(super) unsafe fn transition(list: *mut c_void, res: usize, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) {
     let b = D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
@@ -3331,12 +3342,14 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     if let Some((_, ref prior, _)) = kickoff_split {
         if !prior.is_empty() {
             execute_with_waits_on(q_raw, prior, |chunk| {
-                exec(q_raw, chunk.len() as u32, chunk.as_ptr());
-                copy_scratch_submitted(q_raw, chunk);
-                super::alloc_pool::executed(q_raw, chunk);
-                signal_write64_fences(q_raw, chunk);
-                readback_sparse_writes(q_raw, chunk);
-                cpu_writes_after(q_raw, chunk);
+                super::alloc_pool::submit_with_mesh_tracking(q_raw, chunk, |ready| {
+                    exec(q_raw, ready.len() as u32, ready.as_ptr());
+                    copy_scratch_submitted(q_raw, ready);
+                }, |ready| {
+                    signal_write64_fences(q_raw, ready);
+                    readback_sparse_writes(q_raw, ready);
+                    cpu_writes_after(q_raw, ready);
+                });
             });
             super::title_textures::submitted(prior);
             for &p in prior {
@@ -3350,10 +3363,10 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     }
 
     let one = [this];
-    exec(q_raw, 1, one.as_ptr());
-    copy_scratch_submitted(q_raw, &one);
-    super::alloc_pool::executed(q_raw, &one);
-    signal_write64_pairs(q_raw, &write64_signals);
+    super::alloc_pool::submit_with_mesh_tracking(q_raw, &one, |ready| {
+        exec(q_raw, ready.len() as u32, ready.as_ptr());
+        copy_scratch_submitted(q_raw, ready);
+    }, |_| signal_write64_pairs(q_raw, &write64_signals));
     // what ran is in the textures' states; the list records anew after its Reset below
     super::title_textures::submitted(&one);
     super::title_textures::list_reset(this as usize);
@@ -3897,6 +3910,10 @@ pub(super) unsafe fn ensure_view_heap(this: *mut c_void) {
 pub(super) unsafe extern "system" fn set_descriptor_heaps_x(this: *mut c_void, n: u32, heaps: *const usize) {
     const PC_SET_DESCRIPTOR_HEAPS: usize = 28;
     let f = pc::<unsafe extern "system" fn(*mut c_void, u32, *const usize)>(this, PC_SET_DESCRIPTOR_HEAPS);
+    if super::bind::mesh_indirect::on() {
+        let named = if heaps.is_null() || n > 2 { &[] } else { std::slice::from_raw_parts(heaps, n as usize) };
+        super::bind::set_mesh_heaps(this, named);
+    }
     if heaps.is_null() || n == 0 {
         // no heaps: nothing bound any more (`ensure_view_heap` binds the shared heaps again
         // before a translated draw or dispatch reads memory windows or samplers from them)

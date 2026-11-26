@@ -206,6 +206,10 @@ pub(super) unsafe fn two_pass_stream_key(stream: &[u8], ps_samplers: &[crate::gp
                 }
             }
             1..=6 | 24 | 25 => {
+                // Zero bytes make an explicitly present shader subobject inactive.
+                if payload.get(8..16)? == [0; 8] {
+                    continue;
+                }
                 let code = payload_shader(payload)?;
                 shader_bytes = shader_bytes.checked_add(code.len())?;
                 h.u32(ty);
@@ -353,6 +357,36 @@ mod tests {
         }
         let cs = [10u8; 64];
         assert_ne!(two_pass_cs_key(&cs, &[], 1, 1), two_pass_cs_key(&cs, &[], 1, 4));
+    }
+
+    #[test]
+    fn two_pass_stream_key_treats_empty_domain_shader_as_omitted() {
+        let mut stream = StreamOut::default();
+        let ms = [1u8, 2, 3, 4];
+        let ds = [5u8, 6, 7, 8];
+        stream.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &ms);
+        let key = unsafe { two_pass_stream_key(&stream.0, &[], 1, 1) }.unwrap();
+
+        for pointer in [std::ptr::null(), ds.as_ptr().cast()] {
+            let mut explicit = StreamOut(stream.0.clone(), stream.1);
+            explicit.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS, &D3D12_SHADER_BYTECODE {
+                pShaderBytecode: pointer,
+                BytecodeLength: 0,
+            });
+            assert_eq!(unsafe { two_pass_stream_key(&explicit.0, &[], 1, 1) }, Some(key));
+        }
+
+        let mut malformed = StreamOut(stream.0.clone(), stream.1);
+        malformed.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS, &D3D12_SHADER_BYTECODE {
+            pShaderBytecode: std::ptr::null(),
+            BytecodeLength: ds.len(),
+        });
+        assert_eq!(unsafe { two_pass_stream_key(&malformed.0, &[], 1, 1) }, None);
+
+        stream.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS, &ds);
+        let active = unsafe { two_pass_stream_key(&stream.0, &[], 1, 1) }.unwrap();
+        assert_ne!(active.0, key.0);
+        assert_eq!(active.1, key.1 + ds.len());
     }
 
     #[test]

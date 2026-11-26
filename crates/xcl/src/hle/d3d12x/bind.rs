@@ -18,6 +18,8 @@ use windows::Win32::Graphics::Direct3D12::*;
 
 use super::console_list::{self, Layout, Param};
 
+pub(super) mod mesh_indirect;
+
 #[derive(Default)]
 struct State {
     layout: Option<Arc<Layout>>,
@@ -34,6 +36,8 @@ struct State {
     uma: Vec<usize>,
     /// where the next draw's io and argument table go (blocks in `uma`)
     arena: crate::gpu::uma::Arena,
+    mesh_indirect: mesh_indirect::Recording,
+    mesh_heap_bases: [Option<u32>; 2],
 }
 
 static STATES: Mutex<Option<HashMap<usize, State>>> = Mutex::new(None);
@@ -73,7 +77,7 @@ fn with<R>(list: *mut c_void, f: impl FnOnce(&mut State) -> R) -> R {
 /// recording's memory is the previous allocator's until that one is reset, and pipeline
 /// and root signature state reset per D3D12 `CreateCommandList` / `Reset` semantics.
 pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
-    let (old, blocks) = with(list, |s| {
+    let (old, blocks, mesh) = with(list, |s| {
         let old = std::mem::replace(&mut s.allocator, allocator);
         s.arena = Default::default();
         s.pso = initial_pso;
@@ -82,9 +86,11 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
         s.layout_gfx = None;
         s.args_gfx.clear();
         s.rs_gfx = 0;
-        (old, std::mem::take(&mut s.uma))
+        s.mesh_heap_bases = [None; 2];
+        (old, std::mem::take(&mut s.uma), std::mem::take(&mut s.mesh_indirect))
     });
     console_list::hold_until_reset(old, blocks);
+    mesh_indirect::retire(list as usize, mesh);
 }
 
 /// `ClearState(pso)`: resets pipeline and root-argument state back to creation defaults
@@ -97,6 +103,7 @@ pub(super) fn clear_state(list: *mut c_void, pso: usize) {
         s.layout_gfx = None;
         s.args_gfx.clear();
         s.rs_gfx = 0;
+        s.mesh_heap_bases = [None; 2];
     });
 }
 
@@ -104,10 +111,10 @@ pub(super) fn clear_state(list: *mut c_void, pso: usize) {
 /// deferred mid-list split (`to` records into `allocator` with its own fresh UMA arena while
 /// `from` retains its previously allocated blocks until `allocator` resets).
 pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: usize) {
-    let (layout, args, layout_gfx, args_gfx, rs_gfx, pso) = with(from, |s| {
-        (s.layout.clone(), s.args.clone(), s.layout_gfx.clone(), s.args_gfx.clone(), s.rs_gfx, s.pso)
+    let (layout, args, layout_gfx, args_gfx, rs_gfx, pso, heaps) = with(from, |s| {
+        (s.layout.clone(), s.args.clone(), s.layout_gfx.clone(), s.args_gfx.clone(), s.rs_gfx, s.pso, s.mesh_heap_bases)
     });
-    let (old, blocks) = with(to, |s| {
+    let (old, blocks, mesh) = with(to, |s| {
         let old = std::mem::replace(&mut s.allocator, allocator);
         s.arena = Default::default();
         s.layout = layout;
@@ -116,9 +123,19 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
         s.args_gfx = args_gfx;
         s.rs_gfx = rs_gfx;
         s.pso = pso;
-        (old, std::mem::take(&mut s.uma))
+        s.mesh_heap_bases = heaps;
+        (old, std::mem::take(&mut s.uma), std::mem::take(&mut s.mesh_indirect))
     });
     console_list::hold_until_reset(old, blocks);
+    mesh_indirect::retire(to as usize, mesh);
+}
+
+pub(super) fn set_mesh_heaps(list: *mut c_void, heaps: &[usize]) {
+    let mut bases = [None; 2];
+    for (sampler, address) in heaps.iter().filter_map(|&heap| super::console_heap::mesh_heap_base(heap)) {
+        bases[sampler as usize] = Some(address);
+    }
+    with(list, |state| state.mesh_heap_bases = bases);
 }
 
 /// A submit is about to wait for the pipeline `this` has bound.
@@ -139,8 +156,10 @@ pub(super) fn pass_arena(from: *mut c_void, to: *mut c_void) {
 
 /// The list is gone.
 pub(super) fn forget(list: *mut c_void) {
-    if let Some(s) = STATES.lock().unwrap().as_mut().and_then(|m| m.remove(&(list as usize))) {
-        console_list::hold_until_reset(s.allocator, s.uma);
+    let state = STATES.lock().unwrap().as_mut().and_then(|m| m.remove(&(list as usize)));
+    if let Some(state) = state {
+        console_list::hold_until_reset(state.allocator, state.uma);
+        mesh_indirect::retire(list as usize, state.mesh_indirect);
     }
 }
 
@@ -276,6 +295,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     }
     let pso = super::pso_async::resolve_wait(raw_pso);
     let (gfx, compute) = (super::real::is_translated_graphics(pso), super::real::is_translated_compute(pso));
+    let title_args_off = args_off;
     let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
     if !gfx && !compute {
         // A pipeline still being built (or whose build failed): its stand-in draws nothing, and
@@ -296,6 +316,13 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         // with the title's graphics root signature (e.g. a non-DispatchMesh indirect draw or a
         // root-changing signature) invalidates the command list (Close → E_INVALIDARG).
         if let Some(tp) = super::real::two_pass_of(pso) {
+            if mesh_indirect::on() && mesh_indirect::eligible_call(tp.kind, max, count_buf) {
+                match mesh_indirect::record(this, sig, pso, tp.clone(), args, title_args_off) {
+                    Some(Ok(())) => { count(DRAWS); return; }
+                    Some(Err(error)) => mesh_indirect::warn(error),
+                    None => {}
+                }
+            }
             count(DRAWS_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {

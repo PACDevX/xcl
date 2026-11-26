@@ -4030,6 +4030,7 @@ fn compile_slots(bytes: usize) -> &'static Slots {
 /// A driver compile of `bytes` of DXIL through `build`: a huge one on an `xcl-pso*` worker
 /// waits for its slot first (`big_compile_turn`; not a title thread's, nor one the title waits
 /// for). Logs its time, size and whether it was gated.
+#[cfg(test)]
 fn driver_compile<R>(kind: &str, bytes: usize, gate: bool, build: impl FnOnce() -> R) -> R {
     driver_compile_identified(kind, bytes, gate, None, build).0
 }
@@ -4530,6 +4531,19 @@ pub(crate) mod driver_cache {
         enabled().then(|| crate::gpu::recomp::dxc::cache_dir().join("driver").join(graphics_name(hash, bytes)))
     }
 
+    pub(super) fn mesh_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        enabled() && *ON.get_or_init(|| std::env::var("XCL_TWO_PASS_MESH_DISK_CACHE").is_ok_and(|v| v.trim() == "1"))
+    }
+
+    pub(super) fn mesh_path(hash: u64, bytes: usize) -> PathBuf {
+        crate::gpu::recomp::dxc::cache_dir().join("driver").join(format!("tp-mesh-{hash:016x}-{bytes:x}.pso"))
+    }
+
+    pub(super) fn worth_keeping(took: std::time::Duration) -> bool {
+        took >= KEEP
+    }
+
     pub fn load(p: &Path) -> Option<Vec<u8>> {
         std::fs::read(p).ok().filter(|b| !b.is_empty())
     }
@@ -4783,22 +4797,23 @@ unsafe fn read_pso_cached_blob(pso: *mut c_void) -> Option<Vec<u8>> {
     if pso.is_null() {
         return None;
     }
-    let raw = if is_adopted(pso) {
+    let blob = if is_adopted(pso) {
         type GetBlob = unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT;
         let get: GetBlob = std::mem::transmute(orig_fn(pso, slot_of(pso, "GetCachedBlob")));
         let mut out = std::ptr::null_mut();
         if get(pso, &mut out) < 0 || out.is_null() {
             return None;
         }
-        out
+        ID3DBlob::from_raw(out)
     } else {
-        let p = ID3D12PipelineState::from_raw_borrowed(&pso)?;
-        let blob = p.GetCachedBlob().ok()?;
-        return Some(std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize()).to_vec());
+        ID3D12PipelineState::from_raw_borrowed(&pso)?.GetCachedBlob().ok()?
     };
-    let blob = ID3DBlob::from_raw(raw);
-    let bytes = std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize()).to_vec();
-    (!bytes.is_empty()).then_some(bytes)
+    let size = blob.GetBufferSize();
+    let data = blob.GetBufferPointer().cast::<u8>();
+    if size == 0 || data.is_null() {
+        return None;
+    }
+    Some(std::slice::from_raw_parts(data, size).to_vec())
 }
 
 /// The driver's blob of the PSO just built (works on both adopted title PSOs and raw PC compute
@@ -5968,8 +5983,114 @@ fn passthrough_mesh_stream_accepts_a_triangle_driver_blob() {
     }
 }
 
-#[allow(dead_code)] // Consumed by the stacked driver-cache integration.
+#[allow(dead_code)] // The compute-pass key is reserved for a separate integration.
 mod two_pass_identity;
+
+// Mesh half of ZekkJJ's two-pass driver cache (xcl-dev/xcl#1942).
+unsafe fn two_pass_mesh_driver_id(this: *mut c_void) -> Option<u64> {
+    static IDS: Mutex<Option<HashMap<(u32, i32), Option<u64>>>> = Mutex::new(None);
+    let dev = ID3D12Device::from_raw_borrowed(&this)?;
+    let luid = dev.GetAdapterLuid();
+    let mut ids = IDS.lock().unwrap();
+    *ids.get_or_insert_with(HashMap::new).entry((luid.LowPart, luid.HighPart)).or_insert_with(|| {
+        let factory: IDXGIFactory4 = CreateDXGIFactory1().ok()?;
+        let adapter: IDXGIAdapter1 = factory.EnumAdapterByLuid(luid).ok()?;
+        let desc = adapter.GetDesc1().ok()?;
+        let umd = adapter.CheckInterfaceSupport(&IDXGIDevice::IID).ok()?;
+        if umd == 0 {
+            return None;
+        }
+        let mut hash = two_pass_identity::Fnv64::new();
+        for part in [desc.VendorId, desc.DeviceId, desc.SubSysId, desc.Revision, desc.Flags] {
+            hash.u32(part);
+        }
+        hash.u32(crate::gpu::agility::loaded().map_or(0, |(version, _)| version));
+        hash.u64(umd as u64);
+        Some(hash.finish())
+    })
+}
+
+fn create_mesh_stream_cached(
+    stream: &StreamOut,
+    blob: Option<&[u8]>,
+    mut build: impl FnMut(&StreamOut) -> (HRESULT, std::time::Duration),
+) -> (HRESULT, Option<std::time::Duration>) {
+    if let Some(blob) = blob {
+        // The caller owns the shader bytes and the driver blob through the synchronous call.
+        let mut attempt = StreamOut(stream.0.clone(), stream.1);
+        attempt.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO, &D3D12_CACHED_PIPELINE_STATE {
+            pCachedBlob: blob.as_ptr().cast(),
+            CachedBlobSizeInBytes: blob.len(),
+        });
+        let (hr, _) = build(&attempt);
+        use windows::Win32::Foundation::{D3D12_ERROR_ADAPTER_NOT_FOUND, D3D12_ERROR_DRIVER_VERSION_MISMATCH};
+        if hr != E_INVALIDARG && hr != D3D12_ERROR_ADAPTER_NOT_FOUND.0 && hr != D3D12_ERROR_DRIVER_VERSION_MISMATCH.0 {
+            return (hr, None);
+        }
+        // Leave the path in place: another process may already have replaced this blob.
+        // A successful cold build can atomically publish a replacement of its own.
+    }
+    let (hr, took) = build(stream);
+    (hr, Some(took))
+}
+
+#[cfg(test)]
+mod mesh_disk_cache_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn two_pass_mesh_disk_cache_retries_the_original_stream_on_a_stale_blob() {
+        use windows::Win32::Foundation::{D3D12_ERROR_ADAPTER_NOT_FOUND, D3D12_ERROR_DRIVER_VERSION_MISMATCH};
+        let ms = [1u8, 2, 3];
+        let blob = [4u8, 5, 6];
+        let stream = two_pass_mesh_stream(std::ptr::null_mut(), &ms, None);
+        for rejected in [E_INVALIDARG, D3D12_ERROR_ADAPTER_NOT_FOUND.0, D3D12_ERROR_DRIVER_VERSION_MISMATCH.0] {
+            let mut attempts = 0;
+            let result = create_mesh_stream_cached(&stream, Some(&blob), |attempt| {
+                attempts += 1;
+                assert_eq!(attempt.shader_bytes(), ms.len());
+                let subs = stream_subobjects(&attempt.0).unwrap();
+                if attempts == 1 {
+                    let (ty, payload) = subs.last().unwrap();
+                    assert_eq!(*ty, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO.0 as u32);
+                    assert_eq!(&attempt.0[..stream.0.len()], stream.0);
+                    let field = unsafe { payload.as_ptr().cast::<D3D12_CACHED_PIPELINE_STATE>().read_unaligned() };
+                    assert_eq!((field.pCachedBlob, field.CachedBlobSizeInBytes), (blob.as_ptr().cast(), blob.len()));
+                    (rejected, Duration::from_millis(1))
+                } else {
+                    assert_eq!(attempt.0, stream.0);
+                    (S_OK, Duration::from_millis(350))
+                }
+            });
+            assert_eq!(attempts, 2);
+            assert_eq!(result, (S_OK, Some(Duration::from_millis(350))));
+        }
+    }
+
+    #[test]
+    fn two_pass_mesh_disk_cache_keeps_hits_and_non_cache_errors_to_one_call() {
+        let bytes = [1u8];
+        let stream = two_pass_mesh_stream(std::ptr::null_mut(), &bytes, None);
+        for hr in [S_OK, E_OUTOFMEMORY, 0x887a_0005u32 as HRESULT] {
+            let mut attempts = 0;
+            let result = create_mesh_stream_cached(&stream, Some(&bytes), |_| {
+                attempts += 1;
+                (hr, Duration::ZERO)
+            });
+            assert_eq!(attempts, 1);
+            assert_eq!(result, (hr, None));
+        }
+        let mut attempts = 0;
+        let result = create_mesh_stream_cached(&stream, None, |attempt| {
+            attempts += 1;
+            assert_eq!(attempt.0, stream.0);
+            (S_OK, Duration::from_millis(400))
+        });
+        assert_eq!(attempts, 1);
+        assert_eq!(result, (S_OK, Some(Duration::from_millis(400))));
+    }
+}
 
 /// The console PS of a two-pass pipeline (a PC PS passes as it is).
 /// The PS of a two-pass pipeline (DXIL, static samplers – a PC PS passes as it is).
@@ -5985,10 +6106,9 @@ fn two_pass_ps(ps: Option<&[u8]>, split_wave64: bool) -> Result<(Option<Vec<u8>>
 /// Create the mesh pipeline (`stream`, RS and shaders already in it) and the compute pass;
 /// the title gets the mesh pipeline state.
 #[allow(clippy::too_many_arguments)]
-unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu::recomp::pso::TwoPass, mesh_rs: *mut c_void, kind: &'static str, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu::recomp::pso::TwoPass, mesh_rs: *mut c_void, ps_samplers: &[crate::gpu::recomp::pso::StaticSampler], kind: &'static str, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     let Some(rs) = abi_rs_for(this, &tp.samplers) else { return E_INVALIDARG };
     let fs: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreatePipelineState")));
-    let desc: [usize; 2] = [stream.0.len(), stream.0.as_ptr() as usize];
     // the mesh pass and its compute pass: one turn for both
     let bytes = stream.shader_bytes() + tp.cs.len();
     let gate = bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
@@ -5997,12 +6117,43 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     if gate {
         crate::xlog_info!("D3D12.X: two-pass {kind} PSO ({bytes} B DXIL) gated, waited {} ms", waited.elapsed().as_millis());
     }
-    let hr = driver_compile(kind, stream.shader_bytes(), false, || finish_pso(this, fs, desc.as_ptr() as *const c_void, riid, ppv));
+    let mesh_path = if driver_cache::mesh_enabled() && !ppv.is_null() {
+        two_pass_mesh_driver_id(this).and_then(|driver| {
+            let windows = crate::gpu::recomp::pso::mem_windows();
+            let (hash, bytes) = two_pass_identity::two_pass_stream_key(&stream.0, ps_samplers, driver, windows)?;
+            (bytes != 0).then(|| driver_cache::mesh_path(hash, bytes))
+        })
+    } else {
+        None
+    };
+    let blob = mesh_path.as_deref().and_then(driver_cache::load);
+    let (hr, cold_time) = create_mesh_stream_cached(stream, blob.as_deref(), |attempt| {
+        let desc = [attempt.0.len(), attempt.0.as_ptr() as usize];
+        if blob.is_some() {
+            *ppv = std::ptr::null_mut();
+        }
+        driver_compile_identified(kind, attempt.shader_bytes(), false, None, || finish_pso(this, fs, desc.as_ptr().cast(), riid, ppv))
+    });
     if hr < 0 || ppv.is_null() || (*ppv).is_null() {
         note_translation_error(format!("the driver rejected the mesh pipeline from the console {kind} ({hr:#x})"));
         return E_INVALIDARG;
     }
     let mesh_pso = *ppv;
+    if let Some(path) = mesh_path.as_deref() {
+        if let Some(took) = cold_time {
+            if driver_cache::worth_keeping(took) {
+                if let Some(bytes) = read_pso_cached_blob(mesh_pso) {
+                    driver_cache::keep(path, &bytes, took);
+                }
+            }
+        } else {
+            static HITS: AtomicU64 = AtomicU64::new(0);
+            let n = HITS.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                crate::xlog_info!("D3D12.X: {n} two-pass mesh pipelines made from a kept driver blob");
+            }
+        }
+    }
     let fc: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateComputePipelineState")));
     let mut cdesc = D3D12_COMPUTE_PIPELINE_STATE_DESC::default();
     cdesc.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
@@ -6163,7 +6314,7 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
             out.raw(*ty, payload, palign == 8);
         }
     }
-    let hr = finish_two_pass(this, &out, tp, rs, "MS", riid, ppv);
+    let hr = finish_two_pass(this, &out, tp, rs, &ps_samplers, "MS", riid, ppv);
     if hr >= 0 {
         super::dred::label(*ppv as usize, &[("ms", Some(ms)), ("ps", console_ps)]);
     }
@@ -6238,7 +6389,7 @@ unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE
     if d.Flags.0 != 0 {
         out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS, &d.Flags);
     }
-    let hr = finish_two_pass(this, &out, tp, rs, "GS", riid, ppv);
+    let hr = finish_two_pass(this, &out, tp, rs, &ps_samplers, "GS", riid, ppv);
     if hr >= 0 {
         super::dred::label(*ppv as usize, &[("vs", Some(vs)), ("gs", Some(gs)), ("ps", shader_bytes(&d.PS))]);
     }
@@ -7278,13 +7429,15 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     }
     super::list_x::note_queue_for_lists(this as usize, &mapped);
     super::list_x::execute_with_waits_on(this, &mapped, |chunk| {
-        let _ = super::alloc_pool::note_resubmits(this, chunk);
-        f(this, chunk.len() as u32, chunk.as_ptr());
-        super::list_x::copy_scratch_submitted(this, chunk);
-        super::alloc_pool::executed(this, chunk);
-        super::list_x::signal_write64_fences(this, chunk);
-        super::list_x::readback_sparse_writes(this, chunk);
-        super::list_x::cpu_writes_after(this, chunk);
+        super::alloc_pool::submit_with_mesh_tracking(this, chunk, |ready| {
+            let _ = super::alloc_pool::note_resubmits(this, ready);
+            f(this, ready.len() as u32, ready.as_ptr());
+            super::list_x::copy_scratch_submitted(this, ready);
+        }, |ready| {
+            super::list_x::signal_write64_fences(this, ready);
+            super::list_x::readback_sparse_writes(this, ready);
+            super::list_x::cpu_writes_after(this, ready);
+        });
     });
     // the next uploads into textures kept in step start from the states these lists leave
     super::title_textures::submitted(&mapped);
@@ -7415,15 +7568,30 @@ pub fn log_device_removed() {
                 v.join(", ")
             };
             let va = pf.PageFaultVA;
-            let window = uma_window_vas().iter().position(|&w| va >= w && va < w + 0x1_0000_0000).map(|k| format!(" = window {k} + {:#x}", va - uma_window_vas()[k])).unwrap_or_default();
+            let window = UMA_BUFFER.try_lock().ok()
+                .and_then(|buffers| {
+                    if buffers.is_empty() { return None; }
+                    // open_uma only publishes bindings after UMA is initialized.
+                    let uma = crate::gpu::uma::get()?;
+                    dred_fault_window(va, &buffers, |index| uma.window(index).1 as u64)
+                })
+                .map(|(index, offset)| format!(" = window {index} + {offset:#x}"))
+                .unwrap_or_default();
             crate::xlog_error!("DRED page fault at GPU VA {va:#x}{window}; allocations there: [{}]; recently freed: [{}]", names(pf.pHeadExistingAllocationNode), names(pf.pHeadRecentFreedAllocationNode));
         }
         if let Ok(bc) = dred.GetAutoBreadcrumbsOutput() {
             report_dred_lists(bc.pHeadAutoBreadcrumbNode, |node, done| {
                 let count = node.BreadcrumbCount as usize;
-                let ops: Vec<String> = (done.saturating_sub(3)..(done + 3).min(count)).map(|i| format!("{}{}", if i == done { ">" } else { "" }, (*node.pCommandHistory.add(i)).0)).collect();
                 let list = node.pCommandList.as_ref().map_or(std::ptr::null_mut(), |l| l.as_raw());
-                let history: Vec<i32> = if node.pCommandHistory.is_null() { Vec::new() } else { std::slice::from_raw_parts(node.pCommandHistory, count).iter().map(|o| o.0).collect() };
+                let queue = node.pCommandQueue.as_ref().map_or(std::ptr::null_mut(), |q| q.as_raw());
+                let Some(operations) = dred_command_history(node) else {
+                    crate::xlog_error!("DRED: list {list:p} on queue {queue:p}: {done} of {count} operations done; command history unavailable or wrapped");
+                    return;
+                };
+                let history: Vec<i32> = operations.iter().map(|op| op.0).collect();
+                let ops: Vec<String> = (done.saturating_sub(3)..(done + 3).min(history.len()))
+                    .map(|i| format!("{}{}", if i == done { ">" } else { "" }, history[i]))
+                    .collect();
                 let name = if node.pCommandListDebugNameW.is_null() { None } else { node.pCommandListDebugNameW.to_string().ok() };
                 let key = super::dred::node_list(list as usize, name.as_deref());
                 let mut bound = super::dred::bound_at(key, &history, done).map(|l| format!("; pipeline bound there: {l}")).unwrap_or_default();
@@ -7431,10 +7599,73 @@ pub fn log_device_removed() {
                 if !after.is_empty() {
                     bound += &format!("; bound after it: {}", after.iter().take(4).cloned().collect::<Vec<_>>().join(", "));
                 }
-                crate::xlog_error!("DRED: list {:p} on queue {:p}: {done} of {count} operations done, around: {}{bound}", list, node.pCommandQueue.as_ref().map_or(std::ptr::null_mut(), |q| q.as_raw()), ops.join(" "));
+                crate::xlog_error!("DRED: list {list:p} on queue {queue:p}: {done} of {count} operations done, around: {}{bound}", ops.join(" "));
             });
         }
     }
+}
+
+unsafe fn dred_command_history(node: &D3D12_AUTO_BREADCRUMB_NODE) -> Option<&[D3D12_AUTO_BREADCRUMB_OP]> {
+    const HISTORY_CAPACITY: usize = 65_536;
+    let count = node.BreadcrumbCount as usize;
+    if count == 0 {
+        return Some(&[]);
+    }
+    // The DRED counter can outgrow its fixed ring. Pipeline attribution needs
+    // the complete command order, so keep only the progress counters in this case.
+    if node.pCommandHistory.is_null() || count > HISTORY_CAPACITY {
+        return None;
+    }
+    Some(unsafe { std::slice::from_raw_parts(node.pCommandHistory, count) })
+}
+
+fn dred_fault_window(
+    va: u64,
+    buffers: &[(usize, u64)],
+    window_len: impl Fn(usize) -> u64,
+) -> Option<(usize, u64)> {
+    if va == 0 {
+        return None;
+    }
+    buffers.iter().enumerate().find_map(|(index, &(resource, base))| {
+        if resource == 0 || base == 0 {
+            return None;
+        }
+        let offset = va.checked_sub(base)?;
+        (offset < window_len(index)).then_some((index, offset))
+    })
+}
+
+#[cfg(test)]
+#[test]
+fn dred_fault_window_excludes_zero_and_unbacked_windows() {
+    let window = crate::gpu::uma::WINDOW as u64;
+    let buffers = [(0, 0), (0, 2 * window), (1, 0), (1, 4 * window), (1, 6 * window)];
+    let lengths = [0, window, window, window, 512 * 1024 * 1024];
+    let classify = |va| dred_fault_window(va, &buffers, |index| lengths[index]);
+    assert_eq!(classify(0), None);
+    assert_eq!(classify(16), None);
+    assert_eq!(classify(2 * window + 16), None);
+    assert_eq!(classify(4 * window - 1), None);
+    assert_eq!(classify(4 * window), Some((3, 0)));
+    assert_eq!(classify(5 * window - 1), Some((3, window - 1)));
+    assert_eq!(classify(5 * window), None);
+    assert_eq!(classify(6 * window + lengths[4] - 1), Some((4, lengths[4] - 1)));
+    assert_eq!(classify(6 * window + lengths[4]), None);
+}
+
+#[cfg(test)]
+#[test]
+fn dred_history_rejects_missing_or_wrapped_buffers() {
+    let ops = [D3D12_AUTO_BREADCRUMB_OP(2)];
+    let mut node = D3D12_AUTO_BREADCRUMB_NODE::default();
+    assert_eq!(unsafe { dred_command_history(&node) }.unwrap().len(), 0);
+    node.BreadcrumbCount = 1;
+    assert!(unsafe { dred_command_history(&node) }.is_none());
+    node.pCommandHistory = ops.as_ptr();
+    assert_eq!(unsafe { dred_command_history(&node) }.unwrap()[0].0, 2);
+    node.BreadcrumbCount = 65_537;
+    assert!(unsafe { dred_command_history(&node) }.is_none());
 }
 
 /// The GPU hung or the device was removed: the title is stopped at once (a title that goes on
@@ -8437,12 +8668,12 @@ mod mesh_stream_tests {
         unsafe {
             // Case 1: driver returns S_OK but leaves *ppv == null
             let mut out: *mut c_void = std::ptr::null_mut();
-            let hr = finish_two_pass(this, &stream, make_tp(), 0x1234_5678 as *mut c_void, "MS", &iid, &mut out);
+            let hr = finish_two_pass(this, &stream, make_tp(), 0x1234_5678 as *mut c_void, &[], "MS", &iid, &mut out);
             assert_eq!(hr, E_INVALIDARG);
             assert!(out.is_null());
 
             // Case 2: caller passes ppv == null
-            let hr = finish_two_pass(this, &stream, make_tp(), 0x1234_5678 as *mut c_void, "MS", &iid, std::ptr::null_mut());
+            let hr = finish_two_pass(this, &stream, make_tp(), 0x1234_5678 as *mut c_void, &[], "MS", &iid, std::ptr::null_mut());
             assert_eq!(hr, E_INVALIDARG);
         }
     }

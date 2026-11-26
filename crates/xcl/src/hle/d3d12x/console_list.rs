@@ -74,6 +74,9 @@ pub struct Layout {
     pub size: u32,
     pub inline: u32,
     pub inline_gfx: u32,
+    pub(super) inline_ms: u32,
+    /// View/sampler heaps directly indexed by these shaders.
+    pub(super) mesh_heap_flags: [bool; 2],
 }
 
 /// User SGPRs the console's compiler gives root arguments: compute s4…s15 (s0…s3 are the
@@ -83,6 +86,8 @@ const INLINE_SGPRS: u32 = 12;
 const INLINE_SGPRS_GFX: u32 = 24;
 const FIRST_SGPR: usize = 4;
 const FIRST_SGPR_GFX: usize = 8;
+const FIRST_SGPR_MS: usize = 16;
+const INLINE_SGPRS_MS: u32 = 16;
 /// Most bytes of root arguments a layout has. The PC's limit is 64 DWORDs (256 bytes: a
 /// constant or a table 1, a root descriptor 2, D3D12 "Root Signature Limits"); the console's
 /// is not known, so 16 times that. A malformed blob (a count of 0x3FFF_FFFF constants) gets no
@@ -100,11 +105,16 @@ pub fn layout_from_blob(blob: &[u8]) -> Option<Layout> {
     };
     let r = |o: usize| rts0.get(o..o + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
     let (n, poff) = (r(4)? as usize, r(8)? as usize);
-    let mut l = Layout::default();
+    let flags = r(20).unwrap_or(0);
+    let directly_indexed = [
+        D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED.0 as u32,
+        D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED.0 as u32,
+    ];
+    let mut l = Layout { mesh_heap_flags: directly_indexed.map(|flag| flags & flag != 0), ..Layout::default() };
     // the parameters go into user SGPRs in order while each fits whole; from the first one
     // that does not, the rest go to the table (packed from its start) – as the console's
     // compiler expects them (HANDOFF: root argument binding)
-    let (mut spilled, mut spilled_gfx) = (false, false);
+    let (mut spilled, mut spilled_gfx, mut spilled_ms) = (false, false, false);
     for k in 0..n {
         let (ty, pay) = (r(poff + 12 * k)?, r(poff + 12 * k + 8)? as usize);
         let p = match ty {
@@ -126,6 +136,10 @@ pub fn layout_from_blob(blob: &[u8]) -> Option<Layout> {
         spilled_gfx |= l.inline_gfx + bytes > 4 * INLINE_SGPRS_GFX;
         if !spilled_gfx {
             l.inline_gfx += bytes;
+        }
+        spilled_ms |= l.inline_ms + bytes > 4 * INLINE_SGPRS_MS;
+        if !spilled_ms {
+            l.inline_ms += bytes;
         }
         l.size = size;
         l.params.push(p);
@@ -168,6 +182,14 @@ pub fn user_data_for(l: &Layout, user_sgprs: Option<u32>, args: &[u8], table_at:
 /// `user_data` of a draw: the vertex and pixel shader's user SGPRs (inline from s8).
 pub fn user_data_gfx(l: &Layout, args: &[u8], table_at: u64) -> Vec<u32> {
     sgprs(FIRST_SGPR_GFX, l.inline_gfx, args, table_at)
+}
+
+/// Mesh spill-table address is s[8:9], with inline arguments beginning at s16.
+pub(super) fn user_data_ms(l: &Layout, args: &[u8], table_at: u64) -> Vec<u32> {
+    let mut words = sgprs(FIRST_SGPR_MS, l.inline_ms, args, table_at);
+    words.swap(0, 8);
+    words.swap(1, 9);
+    words
 }
 
 fn sgprs(first: usize, inline: u32, args: &[u8], table_at: u64) -> Vec<u32> {

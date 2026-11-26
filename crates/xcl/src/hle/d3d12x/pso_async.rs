@@ -16,6 +16,8 @@ struct Pending {
     job: Mutex<Option<Job>>,
     /// the build went to the workers (a lazy one goes on its first `resolve`)
     sent: std::sync::atomic::AtomicBool,
+    /// for display only: a worker was offered the job, or the title took it to build inline
+    scheduled: std::sync::atomic::AtomicBool,
     /// the real pipeline state (raw pointer), 0 while building or when building failed
     real: AtomicUsize,
     /// the driver pipeline binds get till then (`shared`); 0: the stand-in is one itself
@@ -92,6 +94,10 @@ fn build(p: &Arc<Pending>, job: Job, preload: bool) {
 }
 
 impl Pending {
+    fn in_progress(&self) -> bool {
+        self.scheduled.load(Ordering::Relaxed) && !*self.done.lock().unwrap()
+    }
+
     /// One of the title's threads is about to wait for it: the worker building it goes on now,
     /// at a normal priority.
     fn want(&self) {
@@ -314,6 +320,7 @@ fn queue() -> &'static Mutex<mpsc::Sender<Work>> {
 }
 
 fn enqueue(p: Arc<Pending>) {
+    p.scheduled.store(true, Ordering::Relaxed);
     let _ = queue().lock().unwrap().send(Box::new(move || build_queued(&p)));
 }
 
@@ -389,6 +396,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
     let p = Arc::new(Pending {
         job: Mutex::new(Some(job)),
         sent: std::sync::atomic::AtomicBool::new(send),
+        scheduled: Default::default(),
         real: AtomicUsize::new(0),
         driver: AtomicUsize::new(0),
         done: Mutex::new(false),
@@ -410,6 +418,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
         enqueue(p);
     } else if used::known(key) {
         if let Some(q) = preload() {
+            p.scheduled.store(true, Ordering::Relaxed);
             q.list.lock().unwrap().push_back(p);
             q.cv.notify_one();
         }
@@ -595,6 +604,57 @@ mod used_tests {
         assert!(calls.holds(7, now), "twenty short PC calls since the last frame and one going on, but the title is not held");
         assert!(!calls.holds(8, now), "a frame was shown, the calls before it still hold the title");
         calls.end(20, 8, now);
+    }
+
+    #[test]
+    fn window_activity_excludes_lazy_standins_and_counts_requested_builds() {
+        let _sat = WORKER_SATURATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let timeout = std::time::Duration::from_secs(10);
+        let preload_key = 0x7E57_BF41u64;
+        used::earlier_run_used(preload_key);
+
+        #[derive(PartialEq)]
+        enum Request { Inline, Worker, Submit, Preload }
+
+        for (i, request) in [Request::Inline, Request::Worker, Request::Submit, Request::Preload].into_iter().enumerate() {
+            let preloaded = request == Request::Preload;
+            if preloaded && preload().is_none() {
+                continue;
+            }
+            let standin = 0x7E57_BF42usize + i;
+            let (entered, started) = mpsc::channel();
+            let (finish, wait) = mpsc::channel();
+            let key = if preloaded { preload_key } else { 0 };
+            submit_lazy(standin, request == Request::Inline, Box::new(move || {
+                let _ = entered.send(());
+                let _ = wait.recv();
+                0x5253
+            }), key);
+            let p = entry(standin).unwrap();
+            assert_eq!(p.in_progress(), preloaded, "only the preload was offered a job");
+            let bind = match request {
+                Request::Inline => Some(std::thread::spawn(move || resolve_wait_for(standin, None))),
+                Request::Worker => {
+                    assert_eq!(resolve(standin), standin);
+                    None
+                }
+                Request::Submit => {
+                    need_by_submit(standin);
+                    None
+                }
+                Request::Preload => None,
+            };
+            started.recv_timeout(timeout).expect("the job started");
+            assert!(p.in_progress(), "the job has not finished");
+            finish.send(()).unwrap();
+            let real = match bind {
+                Some(bind) => bind.join().unwrap(),
+                None => resolve_wait_for(standin, None),
+            };
+            assert_eq!(real, 0x5253);
+            assert!(!p.in_progress(), "the job finished");
+            assert_eq!(released(standin), real);
+        }
     }
 
     /// While a bind waits for a pipeline still being built, the title is held (`title_held`):
@@ -1084,6 +1144,7 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     }
     let job = p.job.lock().unwrap().take();
     if let Some(job) = job {
+        p.scheduled.store(true, Ordering::Relaxed);
         complete(&p, job());
     }
     p.want();
@@ -1223,9 +1284,16 @@ pub fn want(pso: usize) {
 pub fn need_by_submit(pso: usize) {
     let Some(p) = entry(pso) else { return };
     if !std::mem::replace(&mut p.demand.lock().unwrap().by_submit, true) {
+        p.scheduled.store(true, Ordering::Relaxed);
         NEEDED.lock().unwrap().push_back(p);
         let _ = queue().lock().unwrap().send(Box::new(|| ()));
     }
+}
+
+/// Window title counts: unfinished builds already scheduled and cumulative failed builds.
+pub(super) fn window_activity() -> (usize, usize) {
+    let active = PENDING.lock().unwrap().as_ref().map_or(0, |m| m.values().filter(|p| p.in_progress()).count());
+    (active, FAILED.load(Ordering::Relaxed))
 }
 
 /// (built in the background, failed, still building)
