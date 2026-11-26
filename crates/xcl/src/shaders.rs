@@ -2141,14 +2141,19 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                     record_done();
                     continue;
                 };
-                let Some(sh) = xbox::parse(&blob) else {
-                    if startup.is_some() && !matches!(shader::classify(&blob).0, shader::Kind::Dxil | shader::Kind::Dxbc) {
-                        failed.fetch_add(1, Ordering::Relaxed);
+                let sh = xbox::parse(&blob);
+                let stage = match &sh {
+                    Some(sh) => sh.stage.as_str(),
+                    None if recomp::pso::fspx(&blob).is_some() => "cs",
+                    None => {
+                        if startup.is_some() && !matches!(shader::classify(&blob).0, shader::Kind::Dxil | shader::Kind::Dxbc) {
+                            failed.fetch_add(1, Ordering::Relaxed);
+                        }
+                        record_done();
+                        continue;
                     }
-                    record_done();
-                    continue;
                 };
-                if only.is_some_and(|o| !sh.stage.eq_ignore_ascii_case(o)) {
+                if only.is_some_and(|o| !stage.eq_ignore_ascii_case(o)) {
                     record_done();
                     continue;
                 }
@@ -2159,7 +2164,10 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                 }
                 // a compute program as a title's pipeline translates it (`pso::console_to_dxil_in`):
                 // into the translation cache too, so the title does not translate it again
-                if sh.fssm.iter().any(|f| matches!(recomp::interface(&blob, &sh, f), Some(recomp::Mode::Compute(_)))) {
+                let compute = sh.as_ref().is_none_or(|sh| {
+                    sh.fssm.iter().any(|f| matches!(recomp::interface(&blob, sh, f), Some(recomp::Mode::Compute(_))))
+                });
+                if compute {
                     if used.is_some_and(|u| !used_compute(&blob, u)) {
                         unused.fetch_add(1, Ordering::Relaxed);
                         record_done();
@@ -2186,6 +2194,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                     record_done();
                     continue;
                 }
+                let Some(sh) = sh else { continue };
                 for f in &sh.fssm {
                     let Some(mode) = recomp::interface(&blob, &sh, f) else { continue };
                     let jobs: Vec<(&str, Option<String>)> = match &mode {
@@ -2691,6 +2700,45 @@ mod tests {
             compute[offset..offset + 4].copy_from_slice(&1u32.to_le_bytes());
         }
         sample(5, &[compute])
+    }
+
+    #[test]
+    fn precompile_fspx_uses_normal_startup_filter_and_record_accounting() {
+        // A one-thread compute shader ending in s_endpgm, in a synthetic ACCC part.
+        let mut blob = vec![0u8; 44 + 0x74];
+        blob[..4].copy_from_slice(b"DXBC");
+        blob[36..40].copy_from_slice(b"ACCC");
+        blob[44..48].copy_from_slice(b"FSPX");
+        let len = blob.len() as u32;
+        for (offset, value) in [(20, 1), (24, len), (28, 1), (32, 36), (40, 0x74),
+            (44 + 8, 2), (44 + 0x14, 0x30), (44 + 0x18, 0x1c),
+            (44 + 0x20, 6), (44 + 0x24, 0x4c), (44 + 0x28, 0x28), (44 + 0x70, 0xbf81_0000)] {
+            blob[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        for offset in [0x3c, 0x3e, 0x40] { blob[44 + offset] = 1; }
+        assert!(xbox::parse(&blob).is_none());
+        assert!(recomp::pso::fspx(&blob).is_some());
+        let mut malformed = blob.clone();
+        malformed[44 + 0x3c] = 0;
+        assert!(recomp::pso::fspx(&malformed).is_none());
+
+        let mut data = Vec::new();
+        let records = [("fspx", blob), ("malformed", malformed)].map(|(name, payload)| {
+            let compressed = miniz_oxide::deflate::compress_to_vec(&payload, 6);
+            let record = pack::Record {
+                name: name.into(), offset: data.len(), flag: 50, data: data.len(),
+                csize: compressed.len(), usize: payload.len(),
+            };
+            data.extend(compressed);
+            record
+        });
+        let input = Input::Pack { data, records: records.to_vec() };
+        let startup = LaunchPreparation { only: Some(HashSet::new()), ..Default::default() };
+        let error = precompile(&input, 2, 4, Some(false), Some("cs"), false, None, std::time::Instant::now(), Some(&startup)).unwrap_err();
+        // The startup filter skips the valid record without calling the compiler. The invalid
+        // record still counts as a failure. Both records advance startup progress exactly once.
+        assert!(error.contains("stopped: 1 record failures"), "{error}");
+        assert_eq!(startup.done.load(Ordering::Relaxed), 2);
     }
 
     #[test]
